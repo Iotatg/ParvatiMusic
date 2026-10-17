@@ -1,0 +1,8 @@
+target/
+.env
+*.session
+session.string
+lib/
+native/
+downloads/
+cache/

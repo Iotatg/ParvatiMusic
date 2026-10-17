@@ -1,0 +1,28 @@
+[package]
+name        = "ferogram-crypto"
+description = "Cryptographic primitives for Telegram MTProto: AES-IGE, RSA, SHA-1/256, auth key derivation"
+readme      = "README.md"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+documentation = "https://docs.rs/ferogram-crypto"
+keywords      = ["telegram", "mtproto", "crypto", "aes", "rsa"]
+categories    = ["cryptography", "api-bindings"]
+
+[dependencies]
+tracing    = { version = "0.1" }
+aes        = "0.9.1"
+ctr        = "0.10.0"
+getrandom  = "0.4.0"
+hmac       = "0.13.0"
+num-bigint = "0.5.1"
+num-traits = "0.2.19"
+pbkdf2     = "0.13.0"
+sha1       = "0.11.0"
+sha2       = "0.11.0"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

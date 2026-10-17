@@ -1,0 +1,94 @@
+# ferogram-tl-types
+
+Auto-generated Rust types for all Telegram API constructors, functions, and enums.
+
+[![Crates.io](https://img.shields.io/crates/v/ferogram-tl-types?style=flat-square&logo=rust&logoColor=white&color=F97316)](https://crates.io/crates/ferogram-tl-types)
+[![Telegram Channel](https://img.shields.io/badge/Channel-Ferogram-06B6D4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/Ferogram) [![Telegram Chat](https://img.shields.io/badge/Chat-FerogramChat-06B6D4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/FerogramChat)
+[![docs.rs](https://img.shields.io/badge/docs.rs-ferogram--tl--types-5865F2?style=flat-square&logo=docs.rs&logoColor=white)](https://docs.rs/ferogram-tl-types)
+[![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-64748B?style=flat-square)](#license)
+
+2,329 TL definitions generated at build time from the current TL Layer. All constructors, functions, and abstract types are represented as Rust structs and enums with binary TL serialization and deserialization.
+
+Most users get this through `ferogram` directly. For installation instructions see the [ferogram README](https://github.com/ankit-chaubey/ferogram).
+
+---
+
+## Generated Structure
+
+```rust
+// TL constructors become structs
+pub mod types {
+    pub struct Message {
+        pub id:      i32,
+        pub peer_id: enums::Peer,
+        pub message: String,
+        // optional fields wrapped in Option<>
+    }
+}
+
+// Abstract TL types become enums
+pub mod enums {
+    pub enum Message {
+        Message(types::Message),
+        Service(types::MessageService),
+        Empty(types::MessageEmpty),
+    }
+}
+
+// TL functions become structs implementing RemoteCall
+pub mod functions {
+    pub mod messages {
+        pub struct SendMessage { /* fields */ }
+        impl RemoteCall for SendMessage {
+            type Return = enums::Updates;
+        }
+    }
+}
+```
+
+---
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---|---|---|
+| `tl-api` | yes | Telegram API schema (`api.tl`) |
+| `tl-mtproto` | no | MTProto internal schema (`mtproto.tl`) |
+| `impl-debug` | yes | `#[derive(Debug)]` on all types |
+| `impl-from-type` | yes | `From<types::T> for enums::E` |
+| `impl-from-enum` | yes | `TryFrom<enums::E> for types::T` |
+| `field-accessors` | yes | Generated getter methods for struct fields |
+| `deserializable-functions` | no | `Deserializable` on function types |
+| `name-for-id` | no | `name_for_id(u32) -> Option<&'static str>` |
+| `impl-serde` | no | `serde::Serialize` / `Deserialize` |
+
+---
+
+## Updating the TL Schema
+
+```bash
+cp new-api.tl ferogram-tl-types/tl/api.tl
+cargo build
+```
+
+`ferogram-tl-gen` regenerates all types at compile time via `build.rs`. No manual code changes needed.
+
+---
+
+## Stack position
+
+```
+ferogram
+└ ferogram-mtproto
+  └ ferogram-tl-types  <-- here
+    └ (build) ferogram-tl-gen
+      └ (build) ferogram-tl-parser
+```
+
+---
+
+## License
+
+This project is licensed under either the MIT License or Apache License 2.0, at your option. See [`LICENSE-MIT`](https://github.com/ankit-chaubey/ferogram/blob/main/LICENSE-MIT) and [`LICENSE-APACHE`](https://github.com/ankit-chaubey/ferogram/blob/main/LICENSE-APACHE) for details.
+
+**Author:** Ankit Chaubey ([@ankit-chaubey](https://github.com/ankit-chaubey))

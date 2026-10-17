@@ -1,0 +1,55 @@
+/*
+ * Copyright (c) 2026 Ankit Chaubey <ankitchaubey.dev@gmail.com>
+ * https://github.com/ankit-chaubey
+ *
+ * Project: ferogram
+ * Website: https://ferogram.dev
+ *
+ * Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+ * https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+ * <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+ * This file may not be copied, modified, or distributed except according
+ * to those terms.
+ */
+
+/// Which MTProto wire framing to use for a connection.
+///
+/// | Variant | Init bytes | Notes |
+/// |---------|-----------|-------|
+/// | `Abridged` | `0xEF` | Lightest framing |
+/// | `Intermediate` | `0xEEEEEEEE` | 4-byte length prefix |
+/// | `Full` | none | length + seqno + CRC32: **default** |
+/// | `Obfuscated` | random 64B | Bypasses DPI / MTProxy |
+/// | `PaddedIntermediate` | random 64B (`0xDDDDDDDD` tag) | Required for `0xDD` MTProxy secrets |
+/// | `FakeTls` | TLS 1.3 ClientHello | Most DPI-resistant; required for `0xEE` MTProxy secrets |
+#[derive(Clone, Debug, Default)]
+pub enum TransportKind {
+    /// MTProto Abridged transport: length prefix is 1 or 4 bytes.
+    Abridged,
+    /// MTProto Intermediate transport: 4-byte LE length prefix.
+    Intermediate,
+    /// MTProto Full transport: 4-byte length + seqno + CRC32.
+    ///
+    /// No init byte is sent. Provides CRC32 integrity and sequence number
+    /// validation on every frame. **Default** transport.
+    #[default]
+    Full,
+    /// Obfuscated2 transport: AES-256-CTR over Abridged framing.
+    /// Required for MTProxy and networks with deep-packet inspection.
+    ///
+    /// `secret` is the 16-byte MTProxy secret, or `None` for keyless obfuscation.
+    Obfuscated { secret: Option<[u8; 16]> },
+    /// Obfuscated PaddedIntermediate transport (`0xDDDDDDDD` tag in nonce).
+    ///
+    /// Same AES-256-CTR obfuscation as `Obfuscated`, but uses Intermediate
+    /// framing and appends 0-15 random padding bytes to each frame.
+    /// Required for `0xDD` MTProxy secrets.
+    PaddedIntermediate { secret: Option<[u8; 16]> },
+    /// FakeTLS transport (`0xEE` prefix in MTProxy secret).
+    ///
+    /// Wraps all MTProto data in fake TLS 1.3 records.
+    FakeTls { secret: [u8; 16], domain: String },
+    /// Not real HTTP - falls back to `Abridged` framing on the same port.
+    /// Use `Abridged` directly instead.
+    Http,
+}
