@@ -114,6 +114,11 @@ pub trait Bot: Send {
     /// Raise the "choosing a sticker" chat indicator in `chat_id`.
     fn send_chat_action_choosing_sticker(&mut self, chat_id: i64) -> Result<bool, String>;
 
+    /// Show "typing…" in the chat. Transports that cannot do it return Ok(false).
+    fn send_typing(&mut self, _chat_id: i64) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Send a sticker by document identity. `reply_to` = 0 for none.
     fn send_sticker(
         &mut self,

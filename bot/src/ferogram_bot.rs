@@ -1020,6 +1020,13 @@ impl Bot for FerogramBot {
         sender.unwrap_or(0).max(0)
     }
 
+    fn send_typing(&mut self, chat_id: i64) -> Result<bool, String> {
+        self.send_chat_action_impl(
+            chat_id,
+            tl::enums::SendMessageAction::SendMessageTypingAction,
+        )
+    }
+
     fn send_chat_action_choosing_sticker(&mut self, chat_id: i64) -> Result<bool, String> {
         self.send_chat_action_impl(
             chat_id,

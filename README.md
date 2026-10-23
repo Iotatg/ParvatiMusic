@@ -133,7 +133,43 @@
   | `DEV_URL` | No | — | Developer profile link shown on repo cards |
   | `COOKIES_LINK` | No | — | Remote URL to YouTube cookies file |
   | `START_IMG_URL` | No | — | Media shown on `/start` greeting |
+  | `APINEX_API_KEY` | No | — | LLM key for the AI chatbot (see [docs/chatbot.md](docs/chatbot.md)) |
+  | `APINEX_MODEL` | No | `free/gemini-3.8-flash` | Chatbot model |
+  | `CHATBOT_ENABLED` | No | `true` | Master switch for the chatbot |
+  | `BOT_NAME` | No | Telegram first name | Persona name and name-trigger source |
+  | `BOT_AGE` / `BOT_FROM` / `BOT_DOB` | No | `19` / `Vrindavan` / `8 August` | Persona identity |
+  | `OWNER_NAME` / `OWNER_USERNAME` | No | — | Owner shown in the persona |
+  | `CHATBOT_TRIGGER` | No | — | Extra comma-separated trigger words |
   | `PORT` | No | `8000` | HTTP health/metrics server port |
+</details>
+
+---
+
+## 🤖 AI Chatbot
+
+<details>
+  <summary><b>💬 [Click to Expand] Persona, triggers and commands</b></summary>
+  <br>
+
+  A built-in persona answers in DMs and in groups. In groups it speaks **only**
+  when called: its name in the text, an `@username` tag, a mention picked from the
+  member list, or a reply to one of its messages. `/chatbot on` merely allows
+  replies in a chat — it never turns the bot into a reply-to-everything bot, admin
+  or not.
+
+  | Command | Effect |
+  | :--- | :--- |
+  | `/chatbot on` | allow replies here (still trigger-only) |
+  | `/chatbot off` | mute the chatbot here |
+  | `/chatbot` | show the current state |
+  | `/resetbot` | forget this chat's memory |
+  | `/gchatbot on\|off` | owner only: master switch |
+
+  > **Silent in a group?** Telegram withholds plain messages from bots that are
+  > neither admin nor privacy-disabled. Make the bot an admin, or run
+  > BotFather → `/setprivacy` → **Disable**.
+
+  Full reference: [docs/chatbot.md](docs/chatbot.md)
 </details>
 
 ---

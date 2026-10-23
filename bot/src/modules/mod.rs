@@ -244,6 +244,7 @@ pub fn init(
     lists::register(&mut reg);
     system::register(&mut reg);
     sticker::register(&mut reg);
+    crate::chatbot::register(&mut reg);
     let _ = REGISTRY.set(reg);
 
     let (bus, rx) = bus();

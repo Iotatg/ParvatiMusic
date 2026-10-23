@@ -1,5 +1,6 @@
 pub mod assistant;
 pub mod buttons;
+pub mod chatbot;
 pub mod config;
 pub mod context;
 pub mod db;
