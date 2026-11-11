@@ -56,6 +56,12 @@ pub fn handle_stop(bot: &mut dyn Bot, m: &TgMessage, cplay: bool) {
 
     let id = g.id;
     drop(g);
-    rooms.drop_room(id);
+    // End the session properly: stop the stream, leave the group call, clear
+    // the mini app's chat and everyone's "in voice" flag. Falls back to a bare
+    // room drop when the mini app is not installed.
+    let who = crate::utils::trim(&format!("{} {}", m.first_name, m.last_name)).to_string();
+    if !crate::webapp::end_session(id, m.sender_id, &who, "end") {
+        rooms.drop_room(id);
+    }
     let _ = bot.reply_text(m, &f_args(l, chat_id, "stopped", &[("user", &mention_of(m))]), None);
 }

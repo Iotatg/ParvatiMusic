@@ -44,6 +44,8 @@ impl DownloadSink for RealSink {
 enum Outcome {
     Replayed,
     Started,
+    /// a mini-app play is downloading; the room was left untouched.
+    Deferred,
     /// status already emitted; caller drops the room.
     Finished,
     Failed,
@@ -85,6 +87,14 @@ fn advance_locked(
     sink: &dyn DownloadSink,
 ) -> Outcome {
     // Loop mode repeats the current track (Go: loopCount decrement).
+    if crate::webapp::play_pending() {
+        // A mini-app tap already chose the next song and its download is in
+        // flight. Advancing now (queue or autoplay) would start a different
+        // track that the user's pick then interrupts — the "it played another
+        // song" report. Leave the room alone; the play thread takes over.
+        parv_info!("monitor", "advance chat {chat_id}: deferred, mini app play pending");
+        return Outcome::Deferred;
+    }
     if r.loop_n > 0 {
         r.set_loop(r.loop_n - 1);
         if r.replay() {

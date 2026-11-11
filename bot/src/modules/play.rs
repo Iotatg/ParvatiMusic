@@ -29,6 +29,11 @@ pub struct PlayOpts {
 pub trait PlaySink {
     fn resolve_query(&self, query: &str, video: bool) -> Vec<crate::models::Track>;
     fn download_track(&self, chat_id: i64, t: &crate::models::Track, err: &mut String) -> String;
+    /// Alternative hits for the same query, used when the first pick cannot be
+    /// downloaded (YouTube refuses some videos for datacenter IPs).
+    fn search_tracks(&self, _query: &str, _video: bool) -> Vec<crate::models::Track> {
+        Vec::new()
+    }
 }
 
 /// Registry-backed sink used by the registered commands.
@@ -37,6 +42,9 @@ pub struct RealSink;
 impl PlaySink for RealSink {
     fn resolve_query(&self, query: &str, video: bool) -> Vec<crate::models::Track> {
         registry::resolve_query(query, video)
+    }
+    fn search_tracks(&self, query: &str, video: bool) -> Vec<crate::models::Track> {
+        registry::search_tracks(query, video)
     }
     fn download_track(&self, chat_id: i64, t: &crate::models::Track, err: &mut String) -> String {
         use std::sync::atomic::AtomicBool;
@@ -372,6 +380,32 @@ pub fn handle_play(bot: &mut dyn Bot, m: &TgMessage, opts: PlayOpts, sink: &dyn 
             drop(guard);
             lm.eor(bot, &f_args(loc, chat_id, "play_download_canceled", &[("user", &mention)]), None);
             return;
+        }
+        // Per-video blocks are common on datacenter IPs: walk the other hits
+        // for the same query before telling the chat it failed.
+        if path.is_empty() && dl_err != "canceled" {
+            for alt in sink.search_tracks(&first.title, opts.video).into_iter().take(4) {
+                if alt.id == first.id {
+                    continue;
+                }
+                let mut alt = alt;
+                alt.requester = mention.clone();
+                alt.video = opts.video;
+                crate::parv_info!("play", "retry download: {}", alt.title);
+                let mut e2 = String::new();
+                let p2 = sink.download_track(chat_id, &alt, &mut e2);
+                if !p2.is_empty() {
+                    first = alt;
+                    path = p2;
+                    dl_err.clear();
+                    break;
+                }
+                if e2 == "canceled" {
+                    dl_err = e2;
+                    break;
+                }
+                dl_err = e2;
+            }
         }
         if path.is_empty() {
             crate::parv_error!("play", "Download failed: {dl_err}");

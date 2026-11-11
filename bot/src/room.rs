@@ -166,7 +166,13 @@ impl RoomState {
         self.muted = false;
         self.updated_at = now_secs();
         if path.is_empty() {
+            // No file yet: the monitor re-queues it, so the session clock and
+            // the track counter start when it is actually handed over.
             self.queue.push(t);
+        } else {
+            // Single choke point for "a track started": every play path
+            // (bot command, mini app, skip, autoplay) ends up here.
+            crate::webapp::begin_session(self.id);
         }
         PlayAction::Started
     }

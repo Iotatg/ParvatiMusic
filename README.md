@@ -42,6 +42,43 @@
 
 ---
 
+## 📱 Mini App
+
+A full Telegram Mini App ships with the bot: **Song · Chat · Members · Queue ·
+Profile** — the room's live playback, queue, chat with real Telegram stickers
+(WebP, WebM and animated `.tgs`), member moderation and listening stats, all
+driven by the same `RoomState` the chat commands use.
+
+The room chat is scoped to the people **in the voice chat** (switch to
+*Everyone* for the whole group; hidden messages are announced with a
+"Show all" banner, never silently dropped). The Members tab lists everyone in
+voice first, then the whole group with a one-tap invite. Invites and shares
+always carry the bot's @username (`t.me/share/url`), and the lock button opens
+**private chats** that never appear in the group or the room.
+
+Extras that need no bot command: recently played, favourites, a sleep timer,
+queue reorder, recent searches, and a **Lite mode** that drops live blur on
+older phones (auto-enabled on low-end devices, toggleable in Profile).
+
+<p align="center">
+  <img src="miniapp/docs/v6-song.png" width="19%" alt="Now playing" />
+  <img src="miniapp/docs/v6-chat-vc.png" width="19%" alt="Room chat" />
+  <img src="miniapp/docs/v6-members.png" width="19%" alt="Members and roles" />
+  <img src="miniapp/docs/v6-private-thread.png" width="19%" alt="Private chat" />
+  <img src="miniapp/docs/v6-invite.png" width="19%" alt="Invite and share" />
+</p>
+
+```bash
+cd miniapp && node server.mjs      # preview with a demo room → localhost:8787
+```
+
+The bridge lives in `bot/src/webapp.rs` and is started by `main.rs`; point
+`MINIAPP_CHAT_ID` at your voice chat and set the BotFather menu button to the
+served URL. See **[docs/miniapp.md](docs/miniapp.md)** for wiring, the JSON API
+and the access-token guard.
+
+---
+
 ## 🚀 Quick Deploy
 
 <details>

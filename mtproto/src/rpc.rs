@@ -227,6 +227,63 @@ impl Client {
         }
     }
 
+    /// Every participant id of a supergroup, most recent first
+    /// (channels.getParticipants). Instead of decoding each
+    /// `channelParticipant*` variant, the response is scanned for the
+    /// participant constructors and the user id that always follows the flag
+    /// word. Names and roles come from the Bot API afterwards.
+    pub fn channel_participant_ids(&mut self, chat_id: i64, limit: i32) -> Result<Vec<i64>, String> {
+        let (channel_id, cah) = self.resolve_channel(chat_id)?;
+        let mut w = TlWriter::new();
+        w.u32(0x77ced9d0); // channels.getParticipants
+        w.u32(0xf35aec28); // inputChannel
+        w.i64(channel_id);
+        w.i64(cah);
+        w.u32(0xde3f3c79); // channelParticipantsRecent
+        w.i32(0); // offset
+        w.i32(limit);
+        w.i64(0); // hash
+        let resp = self.call_rpc(w.out(), true, false).map_err(|e| {
+            eprintln!("[mt] getParticipants error cid={channel_id}: {e}");
+            e
+        })?;
+
+        // participant constructor -> byte offset of user_id from the crc
+        const VARIANTS: [(u32, usize); 5] = [
+            (0x1bd54456, 8), // channelParticipant     flags, user_id
+            (0x34c3bb53, 8), // channelParticipantAdmin
+            (0x2fe601d3, 8), // channelParticipantCreator
+            (0xa9478a1a, 8), // channelParticipantSelf
+            (0xd5f0ad91, 12), // channelParticipantBanned  flags, peer, …
+        ];
+        let mut ids: Vec<i64> = Vec::new();
+        let mut i = 0usize;
+        while i + 16 <= resp.len() {
+            let crc = u32::from_le_bytes([resp[i], resp[i + 1], resp[i + 2], resp[i + 3]]);
+            if let Some((_, off)) = VARIANTS.iter().find(|(c, _)| *c == crc) {
+                if i + off + 8 <= resp.len() {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&resp[i + off..i + off + 8]);
+                    let id = i64::from_le_bytes(b);
+                    // Plausible Telegram user ids only: the Bot API lookup
+                    // that follows rejects anything else anyway.
+                    if (1_000..10_000_000_000_000).contains(&id) && !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            i += 4;
+        }
+        if ids.is_empty() {
+            return Err(format!(
+                "getParticipants returned no participants len={} {}",
+                resp.len(),
+                hex_dump(&resp, 64)
+            ));
+        }
+        Ok(ids)
+    }
+
     /// Resolve the currently active group call of a superchannel (getFullChannel).
     pub fn get_group_call(&mut self, chat_id: i64) -> Result<GroupCallRef, String> {
         let (channel_id, cah) = self.resolve_channel(chat_id)?;
@@ -323,6 +380,130 @@ impl Client {
         self.self_id = id;
         self.self_ah = ah;
         Ok((id, ah))
+    }
+
+    /// Start a voice chat in the channel (phone.createGroupCall).
+    ///
+    /// Telegram returns the new call inside an `Updates` container, so instead
+    /// of decoding it the call is re-read with `getFullChannel` until it shows
+    /// up. Needs `manage_voice_chats` in the channel — otherwise the RPC comes
+    /// back with CHAT_ADMIN_REQUIRED and the caller gets that message.
+    pub fn create_group_call(&mut self, chat_id: i64, title: &str) -> Result<GroupCallRef, String> {
+        let (channel_id, cah) = self.resolve_channel(chat_id)?;
+        let mut w = TlWriter::new();
+        w.u32(0x48cdc6d8); // phone.createGroupCall
+        w.u32(1); // flags: title present
+        w.u32(0x27bcbbfc); // inputPeerChannel (peer is an InputPeer, not InputChannel)
+        w.i64(channel_id);
+        w.i64(cah);
+        // Schema: random_id is an *int* here (not long) — writing 8 bytes
+        // shifts every following field and Telegram answers INPUT_FETCH_ERROR.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i32)
+            .unwrap_or(1);
+        w.i32(seed);
+        w.str(title);
+        let _resp = self.call_rpc(w.out(), true, false)?;
+        let mut last = String::new();
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            match self.get_group_call(chat_id) {
+                Ok(c) => return Ok(c),
+                Err(e) => last = e,
+            }
+        }
+        Err(if last.is_empty() {
+            "group call was not created".into()
+        } else {
+            last
+        })
+    }
+
+    /// `get_group_call`, but starts the voice chat when there is none. This is
+    /// what makes `/play` work in a group where nobody opened the call yet:
+    /// the assistant creates it and joins.
+    pub fn ensure_group_call(&mut self, chat_id: i64, title: &str) -> Result<GroupCallRef, String> {
+        match self.get_group_call(chat_id) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                if !e.contains("is closed") && !e.contains("no inputGroupCall") {
+                    return Err(e);
+                }
+                match self.create_group_call(chat_id, title) {
+                    Ok(c) => Ok(c),
+                    Err(e2) => Err(format!("{e2} (voice chat could not be started: {e})")),
+                }
+            }
+        }
+    }
+
+    /// Leave an active group call (phone.leaveGroupCall).
+    ///
+    /// `source` is the ssrc the client joined with; 0 is accepted by Telegram
+    /// and removes the peer from the call. When the bot is the last
+    /// participant the voice chat closes for everyone, which is exactly what
+    /// `/end` should do.
+    pub fn leave_group_call(&mut self, call: &GroupCallRef) -> Result<(), String> {
+        let mut w = TlWriter::new();
+        w.u32(0x500377f9); // phone.leaveGroupCall
+        w.u32(0xd8aa840f); // inputGroupCall
+        w.i64(call.id);
+        w.i64(call.access_hash);
+        w.i32(0); // source
+        self.call_rpc(w.out(), true, false).map(|_| ())
+    }
+
+    /// Ids of the accounts that are *in* the voice chat right now
+    /// (`phone.getGroupParticipants`). This is the only source of truth for
+    /// "who joined the call": group membership (`channels.getParticipants`)
+    /// lists everyone in the group, which is a different set.
+    ///
+    /// The response carries a `phone.groupParticipants` object whose
+    /// `participants` vector holds `groupCallParticipant` entries. Instead of
+    /// decoding the whole vector (it nests chats/users/video objects), every
+    /// `groupCallParticipant` constructor is scanned and its `peer` read:
+    /// flags:# … peer:Peer date:int … — `peerUser` gives the user id, and the
+    /// `left` flag (bit 1) marks someone who already hung up.
+    pub fn group_call_participant_ids(&mut self, chat_id: i64, limit: i32) -> Result<Vec<i64>, String> {
+        let call = self.get_group_call(chat_id)?;
+        let mut w = TlWriter::new();
+        w.u32(0xc558d8ab); // phone.getGroupParticipants
+        w.u32(0xd8aa840f); // inputGroupCall
+        w.i64(call.id);
+        w.i64(call.access_hash);
+        w.vec_header(0); // ids: empty = every participant
+        w.vec_header(0); // sources: empty
+        w.str(""); // offset
+        w.i32(limit.clamp(1, 200));
+        let resp = self.call_rpc(w.out(), true, false)?;
+
+        const GROUP_CALL_PARTICIPANT: u32 = 0x2a3dc7ac;
+        const PEER_USER: u32 = 0x59511722;
+        let mut ids: Vec<i64> = Vec::new();
+        let mut p = 0usize;
+        while let Some(off) = find_crc(&resp[p..], GROUP_CALL_PARTICIPANT) {
+            let at = p + off;
+            // flags(4) + peer ctor(4) + peer id(8)
+            if at + 20 > resp.len() {
+                break;
+            }
+            let mut r = TlReader::new(&resp[at + 4..]);
+            let flags = r.u32();
+            let peer = r.u32();
+            if peer == PEER_USER {
+                let uid = r.i64();
+                // `left:flags.1` — a participant that already left the call.
+                if flags & (1 << 1) == 0 && uid != 0 && !ids.contains(&uid) {
+                    ids.push(uid);
+                }
+            }
+            p = at + 4;
+        }
+        if ids.is_empty() && find_crc(&resp, 0xf47751b6).is_none() {
+            return Err("groupParticipants: unexpected response shape".into());
+        }
+        Ok(ids)
     }
 
     /// Join an active group call; returns the updateGroupCallConnection params JSON.

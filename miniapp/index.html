@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#000000" />
+<title>Parvati Music</title>
+<link rel="stylesheet" href="assets/css/app.css" />
+<script>
+  // Glass panels (backdrop-filter) are the most expensive thing this UI does,
+  // and Telegram's Android WebView runs them on the CPU for cheap phones.
+  // Detect a low-end device — or an explicit choice saved on this device —
+  // and paint solid panels instead of live blur.
+  (function () {
+    try {
+      var q = new URLSearchParams(location.search);
+      var saved = null;
+      try { saved = localStorage.getItem('pm-lite'); } catch (e) {}
+      var low = (navigator.deviceMemory || 8) <= 4 || (navigator.hardwareConcurrency || 8) <= 4;
+      var lite = q.get('lite') === '1' || (q.get('lite') !== '0' && (saved === '1' || (saved === null && low)));
+      if (lite) document.documentElement.classList.add('fx-lite');
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<!-- ───────────────────────── icon sprite ───────────────────────── -->
+<svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.1"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.3a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.7 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.7 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.7a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.1 4.7a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.3 9v.09a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03z"/></symbol>
+  <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5.5l10-2v12"/><circle cx="6.4" cy="18" r="2.6"/><circle cx="16.4" cy="15.5" r="2.6"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="2.8" y="5.4" width="12.6" height="13.2" rx="2.6"/><path d="M15.4 10.2l5.8-3.1v9.8l-5.8-3.1z"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.6c0 4.3-4 7.8-9 7.8a10 10 0 0 1-2.6-.34L4.2 21l1.2-3.6A7.4 7.4 0 0 1 3 11.6C3 7.3 7 3.8 12 3.8s9 3.5 9 7.8z"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.3"/><path d="M2.8 20c.4-3.4 3-5.6 6.2-5.6s5.8 2.2 6.2 5.6"/><path d="M16.4 5.6a3.3 3.3 0 0 1 0 6.4"/><path d="M18 14.7c2.1.6 3.4 2.4 3.6 5.3"/></symbol>
+  <symbol id="i-queue" viewBox="0 0 24 24"><path d="M4 6.5h9M4 12h6M4 17.5h5"/><path d="M15 17.5l5-3.5-5-3.5z"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.2" r="3.6"/><path d="M4.8 20.2c.5-3.7 3.4-6 7.2-6s6.7 2.3 7.2 6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8.5 5.6l10 6.4-10 6.4z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect x="7.6" y="5.4" width="3.2" height="13.2" rx="1.2" fill="currentColor" stroke="none"/><rect x="13.2" y="5.4" width="3.2" height="13.2" rx="1.2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M6 5.8l9 6.2-9 6.2z" fill="currentColor" stroke="none"/><rect x="16.6" y="5.4" width="2.4" height="13.2" rx="1.2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-repeat" viewBox="0 0 24 24"><path d="M17 2.8l3.2 3.2L17 9.2"/><path d="M20.2 6H7.4A3.4 3.4 0 0 0 4 9.4v1.4"/><path d="M7 21.2L3.8 18 7 14.8"/><path d="M3.8 18h12.8a3.4 3.4 0 0 0 3.4-3.4v-1.4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.5v13M5.5 12h13"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7.6-4.6-7.6-9.4A4.3 4.3 0 0 1 12 7.6a4.3 4.3 0 0 1 7.6 3c0 4.8-7.6 9.4-7.6 9.4z"/></symbol>
+  <symbol id="i-heart-fill" viewBox="0 0 24 24"><path d="M12 20s-7.6-4.6-7.6-9.4A4.3 4.3 0 0 1 12 7.6a4.3 4.3 0 0 1 7.6 3c0 4.8-7.6 9.4-7.6 9.4z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.4A8.4 8.4 0 0 1 9.6 4a8.6 8.6 0 1 0 10.4 10.4z"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V6"/><path d="M6.4 11.6L12 6l5.6 5.6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v13"/><path d="M6.4 12.4L12 18l5.6-5.6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9.2" y="3" width="5.6" height="10.4" rx="2.8"/><path d="M5.8 11.4a6.2 6.2 0 0 0 12.4 0"/><path d="M12 17.6V21"/></symbol>
+  <symbol id="i-mic-off" viewBox="0 0 24 24"><path d="M15 9.4V5.8a3 3 0 0 0-5.7-1.3"/><path d="M9 9.2v2.2a3 3 0 0 0 4.4 2.7"/><path d="M5.8 11.4a6.2 6.2 0 0 0 9.1 5.4"/><path d="M12 17.6V21"/><path d="M4 4l16 16"/></symbol>
+  <symbol id="i-sticker" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9 9 9 0 0 1 9 9z"/><path d="M21 12h-4.6a4.4 4.4 0 0 0-4.4 4.4V21"/><circle cx="9" cy="9.6" r=".9" fill="currentColor" stroke="none"/><circle cx="14.4" cy="9.6" r=".9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M8.6 14.2a4.3 4.3 0 0 0 6.8 0"/><circle cx="9.2" cy="9.8" r=".95" fill="currentColor" stroke="none"/><circle cx="14.8" cy="9.8" r=".95" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M21 3.4L10.4 14M21 3.4l-6.6 17.2-4-6.6-6.6-4z"/></symbol>
+  <symbol id="i-plane" viewBox="0 0 24 24"><path d="M21 3.4L10.4 14M21 3.4l-6.6 17.2-4-6.6-6.6-4z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-verified" viewBox="0 0 24 24"><path d="M12 2.6l2.6 1.9 3.2-.2.9 3.1 2.5 2-1.5 2.8 1.5 2.8-2.5 2-.9 3.1-3.2-.2L12 21.4l-2.6-1.9-3.2.2-.9-3.1-2.5-2L4.3 12 2.8 9.2l2.5-2 .9-3.1 3.2.2z" fill="currentColor" stroke="none"/><path d="M8.4 12.2l2.4 2.4 4.8-4.8" stroke="#000" stroke-width="2.2" fill="none"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4.6" y="10.4" width="14.8" height="9.6" rx="3"/><path d="M8.2 10.4V7.6a3.8 3.8 0 0 1 7.6 0v2.8"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5.4" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="18.6" cy="12" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.6 6.6h14.8M9.4 6.6V4.8h5.2v1.8M6.6 6.6l.9 13.1h9l.9-13.1"/></symbol>
+  <symbol id="i-kick" viewBox="0 0 24 24"><circle cx="9.4" cy="8" r="3.2"/><path d="M3.6 19.4c.4-3.2 2.8-5.3 5.8-5.3 1 0 1.9.2 2.7.6"/><path d="M20.4 9.4l-4.2 4.2M16.2 9.4l4.2 4.2"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4"/><path d="M6.2 17.8L17.8 6.2"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9.4 5.8L15.6 12l-6.2 6.2"/></symbol>
+  <symbol id="i-crown" viewBox="0 0 24 24"><path d="M3.4 8.4l4 3 4.6-5.6 4.6 5.6 4-3-1.6 10.4H5z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.6l4.4 4.4L19 6.6"/></symbol>
+  <symbol id="i-reply" viewBox="0 0 24 24"><path d="M9.4 5.6L4 11l5.4 5.4"/><path d="M4 11h9.4a6.6 6.6 0 0 1 6.6 6.6v.8"/></symbol>
+  <symbol id="i-emoji-plus" viewBox="0 0 24 24"><path d="M20.4 12a8.4 8.4 0 1 1-8.4-8.4"/><path d="M8.8 14.4a4.2 4.2 0 0 0 6.4 0"/><circle cx="9.4" cy="10" r=".95" fill="currentColor" stroke="none"/><circle cx="14.6" cy="10" r=".95" fill="currentColor" stroke="none"/><path d="M19 3.2v4.4M16.8 5.4h4.4"/></symbol>
+</svg>
+
+<div class="stage">
+  <div class="phone">
+    <div class="island" aria-hidden="true"></div>
+    <div class="screen" id="screen">
+      <div class="bg-art" id="bgArt" aria-hidden="true"></div>
+      <div class="bg-veil" aria-hidden="true"></div>
+
+      <div class="app" id="app" data-tab="song" data-playing="false">
+
+        <!-- ───────────── top bar ───────────── -->
+        <header class="topbar" id="topbar">
+          <div class="slot slot-left">
+            <button class="round-btn" id="btnSearch" aria-label="Search">
+              <svg class="ic"><use href="#i-search"/></svg>
+            </button>
+          </div>
+          <div class="slot slot-mid">
+            <button class="room-pill" id="roomPill">
+              <span class="live" id="liveBadge"><span class="live-dot"></span><span id="liveText">LIVE</span></span>
+              <span class="room-meta">
+                <b id="roomName">chingu gang</b>
+                <i id="roomSub">2 in room · 1 online</i>
+              </span>
+            </button>
+          </div>
+          <div class="slot slot-right">
+            <button class="round-btn ghost" id="btnMore" aria-label="More">
+              <svg class="ic"><use href="#i-more"/></svg>
+            </button>
+            <button class="round-btn ghost" id="btnSettings" aria-label="Settings">
+              <svg class="ic"><use href="#i-gear"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- ───────────── content ───────────── -->
+        <main class="content" id="content">
+
+          <!-- ============ SONG ============ -->
+          <section class="view view-song is-active" data-view="song">
+            <div class="empty" id="emptyState">
+              <h2 class="mono-title">NO SONG PLAYING</h2>
+              <p class="empty-sub">Search above or send /play in the bot</p>
+              <button class="primary-pill" id="btnOpenBot">
+                <svg class="ic ic-14"><use href="#i-plane"/></svg> Open bot
+              </button>
+            </div>
+
+            <div class="ended" id="endedState">
+              <div class="ended-ring"><svg class="ic"><use href="#i-mic-off"/></svg></div>
+              <h2 class="mono-title">VOICE CHAT ENDED</h2>
+              <p class="empty-sub" id="endedSub">Everyone left the voice chat</p>
+              <div class="ended-grid" id="endedGrid"></div>
+              <p class="ended-last" id="endedLast"></p>
+              <button class="primary-pill" id="btnRestart">
+                <svg class="ic ic-14"><use href="#i-music"/></svg> Start a new session
+              </button>
+            </div>
+
+            <div class="now" id="nowPlaying">
+              <p class="quote" id="quote">I can't hate anyone, I just know where not to return.</p>
+
+              <div class="art" id="art">
+                <img id="artImg" src="assets/img/cover-khat.jpg" alt="" />
+                <video id="artVideo" class="art-video" playsinline webkit-playsinline
+                       muted loop preload="none" disablepictureinpicture></video>
+                <!-- audio mode: the file itself plays here, so "Play audio"
+                     means you hear it, not just a moving progress bar -->
+                <audio id="artAudio" preload="none" playsinline></audio>
+                <span class="art-badge" id="artBadge"><b>KMT</b><i>360 live</i></span>
+                <span class="art-pulse" aria-hidden="true"></span>
+              </div>
+
+              <div class="track-row">
+                <div class="req-avatar" id="reqAvatar">
+                  <img src="assets/img/av-me.jpg" alt="" />
+                </div>
+                <div class="track-meta">
+                  <h3 id="trackTitle">Navjot Ahuja - Khat (Official Audio)</h3>
+                  <p class="track-sub" id="trackSub">ADDED BY · STALKER</p>
+                </div>
+                <button class="add-btn" id="btnAddCurrent" aria-label="Add to queue">
+                  <svg class="ic"><use href="#i-plus"/></svg>
+                </button>
+              </div>
+
+              <div class="seek-wrap">
+                <div class="seek" id="seek" role="slider" aria-label="Seek" tabindex="0">
+                  <div class="seek-track"><div class="seek-fill" id="seekFill"></div></div>
+                  <div class="seek-knob" id="seekKnob"></div>
+                </div>
+                <div class="seek-times">
+                  <span id="timeNow">0:00</span>
+                  <span id="timeTotal">4:57</span>
+                </div>
+              </div>
+
+              <div class="controls">
+                <button class="ctl" id="btnLoop" aria-label="Loop">
+                  <svg class="ic"><use href="#i-repeat"/></svg>
+                </button>
+                <button class="ctl ctl-main" id="btnPlay" aria-label="Play or pause">
+                  <svg class="ic" id="playIcon"><use href="#i-pause"/></svg>
+                </button>
+                <button class="ctl" id="btnNext" aria-label="Next">
+                  <svg class="ic"><use href="#i-next"/></svg>
+                </button>
+              </div>
+
+              <div class="song-actions">
+                <button class="chip" id="btnFav" aria-pressed="false">
+                  <svg class="ic ic-13"><use href="#i-heart"/></svg>
+                  <span id="favLabel">Like</span>
+                </button>
+                <button class="chip" id="btnSleep">
+                  <svg class="ic ic-13"><use href="#i-moon"/></svg>
+                  <span id="sleepLabel">Sleep</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============ CHAT ============ -->
+          <section class="view view-chat" data-view="chat">
+            <div class="chat-head">
+              <div class="seg" id="chatSeg">
+                <button class="seg-btn is-on" data-scope="vc">
+                  <svg class="ic ic-12"><use href="#i-mic"/></svg>
+                  In voice <i id="vcCount">0</i>
+                </button>
+                <button class="seg-btn" data-scope="all">Everyone</button>
+              </div>
+              <button class="round-mini lock-btn" id="btnPrivate" aria-label="Private chats">
+                <svg class="ic"><use href="#i-lock"/></svg>
+                <span class="lock-dot" id="dmDot"></span>
+              </button>
+            </div>
+            <div class="msgs" id="msgs"></div>
+
+            <div class="reply-bar" id="replyBar">
+              <div class="reply-body">
+                <span class="reply-to" id="replyTo">Reply</span>
+                <span class="reply-text" id="replyText"></span>
+              </div>
+              <button class="round-mini" id="replyCancel"><svg class="ic"><use href="#i-x"/></svg></button>
+            </div>
+
+            <div class="stickers" id="stickerPanel">
+              <div class="sticker-tabs" id="stickerTabs">
+                <button class="sticker-tab is-on" data-pane="emoji">Emoji</button>
+                <button class="sticker-tab" data-pane="sticker">Stickers</button>
+                <button class="sticker-tab" data-pane="premium">Premium</button>
+              </div>
+              <div class="sticker-packs" id="stickerPacks"></div>
+              <div class="sticker-grid" id="stickerGrid"></div>
+            </div>
+
+            <div class="composer">
+              <div class="composer-pill">
+                <button class="pill-icon" id="btnSticker" aria-label="Stickers and emoji">
+                  <svg class="ic"><use href="#i-sticker"/></svg>
+                </button>
+                <div class="chat-input" id="chatInput" contenteditable="true" role="textbox"
+                     aria-label="Message the room" data-ph="Message the room…" spellcheck="false"></div>
+                <button class="pill-send" id="btnSend" aria-label="Send">
+                  <svg class="ic" id="sendIcon"><use href="#i-send"/></svg>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============ MEMBERS ============ -->
+          <section class="view view-members" data-view="members">
+            <div class="list-head">
+              <span class="mono-label" id="membersLabel">MEMBERS · 0</span>
+              <button class="text-btn" id="btnInvite">Invite</button>
+            </div>
+            <div class="role-legend">
+              <span class="tag owner">owner</span>
+              <span class="tag host">host</span>
+              <span class="tag admin">admin</span>
+              <span class="tag title">title</span>
+            </div>
+            <div class="ended-strip" id="membersStrip" hidden>
+              <svg class="ic"><use href="#i-mic-off"/></svg>
+              <span id="membersStripText">Voice chat ended</span>
+            </div>
+            <div class="member-list" id="memberList"></div>
+            <div class="list-foot">
+              <p>Tap a member to promote, demote, kick or ban.</p>
+            </div>
+          </section>
+
+          <!-- ============ QUEUE ============ -->
+          <section class="view view-queue" data-view="queue">
+            <div class="list-head">
+              <span class="mono-label" id="queueLabel">UP NEXT · 3</span>
+              <button class="text-btn" id="btnClearQueue">Clear</button>
+            </div>
+            <div class="queue-list" id="queueList"></div>
+            <div class="empty empty-queue" id="queueEmpty">
+              <h2 class="mono-title">QUEUE IS EMPTY</h2>
+              <p class="empty-sub">Add songs from search or send /play in the bot</p>
+            </div>
+          </section>
+
+          <!-- ============ PROFILE ============ -->
+          <section class="view view-profile" data-view="profile">
+            <div class="profile-hero">
+              <div class="avatar-ring">
+                <img id="meAvatar" src="assets/img/av-me.jpg" alt="" />
+              </div>
+              <div class="me-name">
+                <span id="meName">– ѕ т α ℓ к є я –</span>
+                <svg class="ic ic-verified"><use href="#i-verified"/></svg>
+                <span class="me-tag" id="meTag"></span>
+              </div>
+              <p class="me-handle" id="meHandle">@stalker</p>
+              <button class="primary-pill sm" id="btnTelegram">
+                <svg class="ic ic-13"><use href="#i-plane"/></svg> View on Telegram
+              </button>
+            </div>
+
+            <div class="level-card">
+              <div class="hex"><span id="levelNum">4</span></div>
+              <div class="level-body">
+                <div class="level-title" id="levelTitle">Level 4</div>
+                <div class="level-sub" id="levelSub">1h 0m of listening to level 5</div>
+                <div class="level-bar"><i id="levelFill"></i></div>
+              </div>
+            </div>
+
+            <div class="stat-grid">
+              <div class="stat-card">
+                <span>Session listening</span>
+                <b id="statListen">4h 59m</b>
+              </div>
+              <div class="stat-card">
+                <span>Tracks played</span>
+                <b id="statSongs">125</b>
+              </div>
+            </div>
+
+            <div class="settings-card">
+              <div class="set-row">
+                <div class="set-body">
+                  <b>Lite mode</b>
+                  <span>Solid panels instead of blur — smoother on older phones</span>
+                </div>
+                <button class="switch" id="liteToggle" role="switch" aria-checked="false" aria-label="Lite mode">
+                  <i></i>
+                </button>
+              </div>
+              <div class="set-row" id="btnClearCache" role="button" tabindex="0">
+                <div class="set-body">
+                  <b>Clear media cache</b>
+                  <span>Frees stickers, covers and avatars stored on this device</span>
+                </div>
+                <svg class="ic" style="width:12px;height:12px;color:#55565c"><use href="#i-chevron"/></svg>
+              </div>
+            </div>
+          </section>
+        </main>
+
+        <!-- ───────────── dock ───────────── -->
+        <div class="dock" id="dock">
+          <div class="mini" id="mini">
+            <img id="miniArt" src="assets/img/cover-khat.jpg" alt="" />
+            <div class="mini-body">
+              <span id="miniTitle">Navjot Ahuja - Khat (Official Audio)</span>
+              <i class="mini-prog"><b id="miniFill"></b></i>
+            </div>
+            <button class="mini-btn" id="miniPlay" aria-label="Play or pause">
+              <svg class="ic" id="miniIcon"><use href="#i-pause"/></svg>
+            </button>
+          </div>
+
+          <nav class="tabbar" id="tabbar">
+            <button class="tab is-active" data-tab="song"><svg class="ic"><use href="#i-music"/></svg><span>Song</span></button>
+            <button class="tab" data-tab="chat"><svg class="ic"><use href="#i-chat"/></svg><span>Chat</span><i class="tab-dot" id="chatDot"></i></button>
+            <button class="tab" data-tab="members"><svg class="ic"><use href="#i-users"/></svg><span>Members</span></button>
+            <button class="tab" data-tab="queue"><svg class="ic"><use href="#i-queue"/></svg><span>Queue</span></button>
+            <button class="tab" data-tab="profile"><svg class="ic"><use href="#i-user"/></svg><span>Profile</span></button>
+          </nav>
+        </div>
+      </div>
+
+      <!-- ───────────── search overlay ───────────── -->
+      <div class="overlay search-overlay" id="searchOverlay">
+        <div class="search-head">
+          <div class="search-field">
+            <svg class="ic"><use href="#i-search"/></svg>
+            <input id="searchInput" type="search" placeholder="Search songs or @username" autocomplete="off" />
+            <button class="clear-btn" id="searchClear" aria-label="Clear"><svg class="ic"><use href="#i-x"/></svg></button>
+          </div>
+          <button class="round-btn" id="searchClose" aria-label="Close">
+            <svg class="ic"><use href="#i-x"/></svg>
+          </button>
+        </div>
+        <div class="search-body" id="searchBody">
+          <div class="trend" id="histBlock" hidden>
+            <span class="mono-label">RECENT SEARCHES</span>
+            <div class="chips" id="histChips"></div>
+          </div>
+          <div class="trend">
+            <span class="mono-label">TRENDING</span>
+            <div class="chips" id="trendChips"></div>
+          </div>
+          <div class="results" id="results"></div>
+        </div>
+      </div>
+
+      <!-- ───────────── sheets / menus ───────────── -->
+      <div class="scrim" id="scrim"></div>
+
+      <div class="sheet" id="settingsSheet" role="dialog" aria-label="Settings">
+        <div class="sheet-grab"></div>
+        <div class="sheet-title">Room settings</div>
+        <div class="sheet-rows" id="settingsRows"></div>
+      </div>
+
+      <div class="sheet" id="inviteSheet" role="dialog" aria-label="Invite and share">
+        <div class="sheet-grab"></div>
+        <div class="sheet-title">Invite &amp; share</div>
+        <div class="invite-card" id="inviteCard"></div>
+        <div class="sheet-rows" id="inviteRows"></div>
+      </div>
+
+      <div class="sheet" id="sleepSheet" role="dialog" aria-label="Sleep timer">
+        <div class="sheet-grab"></div>
+        <div class="sheet-title">Sleep timer</div>
+        <p class="sheet-sub" id="sleepSub">Stops the voice chat when the timer runs out.</p>
+        <div class="sleep-grid" id="sleepGrid">
+          <button class="sleep-opt" data-min="15">15 min</button>
+          <button class="sleep-opt" data-min="30">30 min</button>
+          <button class="sleep-opt" data-min="45">45 min</button>
+          <button class="sleep-opt" data-min="60">1 hour</button>
+          <button class="sleep-opt is-off" data-min="0">Off</button>
+        </div>
+      </div>
+
+      <!-- ───────────── pick audio / video ───────────── -->
+      <div class="sheet pick-sheet" id="pickSheet" role="dialog" aria-label="Play this track">
+        <div class="sheet-grab"></div>
+        <div class="pick-head">
+          <img class="pick-art" id="pickArt" src="assets/img/cover-khat.jpg" alt="" />
+          <div class="pick-meta">
+            <b id="pickTitle">Song</b>
+            <span id="pickSub">YouTube · 4:57</span>
+          </div>
+        </div>
+        <div class="pick-actions">
+          <button class="pick-btn" data-kind="audio">
+            <svg class="ic"><use href="#i-music"/></svg>
+            <b>Play audio</b>
+            <span>192 kbps MP3 · sound only · quickest</span>
+          </button>
+          <button class="pick-btn" data-kind="video">
+            <svg class="ic"><use href="#i-video"/></svg>
+            <b>Play video</b>
+            <span>Real 720p video in the call + on screen</span>
+          </button>
+        </div>
+        <div class="sheet-rows">
+          <button class="sheet-row" id="pickQueue">
+            <span class="lbl">Add to queue<div class="hint">Plays after the current song</div></span>
+            <svg class="ic"><use href="#i-plus"/></svg>
+          </button>
+          <button class="sheet-row" id="pickFav">
+            <span class="lbl">Save to favourites<div class="hint">Keeps it one tap away</div></span>
+            <svg class="ic"><use href="#i-heart"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- ───────────── private chats ───────────── -->
+      <div class="dm" id="dmSheet" aria-label="Private chats">
+        <header class="dm-head">
+          <button class="round-btn" id="dmBack" aria-label="Back">
+            <svg class="ic dm-back-ic"><use href="#i-chevron"/></svg>
+          </button>
+          <div class="dm-title">
+            <b id="dmTitle">Private chats</b>
+            <span id="dmSub">Only you and the person you pick</span>
+          </div>
+          <button class="round-btn" id="dmNew" aria-label="New private chat">
+            <svg class="ic"><use href="#i-plus"/></svg>
+          </button>
+        </header>
+        <div class="dm-body" id="dmBody"></div>
+        <div class="dm-composer" id="dmComposer" hidden>
+          <div class="composer-pill">
+            <div class="chat-input" id="dmInput" contenteditable="true" role="textbox"
+                 aria-label="Private message" data-ph="Message privately…" spellcheck="false"></div>
+            <button class="pill-send" id="dmSend" aria-label="Send">
+              <svg class="ic"><use href="#i-send"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="ctx" id="ctxMenu" role="menu">
+        <div class="ctx-head" id="ctxName">stalker</div>
+        <button class="ctx-row" data-act="dm" id="ctxDm">
+          <span>Message privately</span><svg class="ic"><use href="#i-lock"/></svg>
+        </button>
+        <button class="ctx-row" data-act="promote" id="ctxPromote">
+          <span>Promote to admin</span><svg class="ic"><use href="#i-crown"/></svg>
+        </button>
+        <button class="ctx-row" data-act="kick">
+          <span>Kick from room</span><svg class="ic"><use href="#i-kick"/></svg>
+        </button>
+        <button class="ctx-row danger" data-act="ban">
+          <span>Ban from room</span><svg class="ic"><use href="#i-ban"/></svg>
+        </button>
+      </div>
+
+      <div class="toast" id="toast"></div>
+    </div>
+  </div>
+</div>
+
+<script src="assets/js/app.js"></script>
+</body>
+</html>

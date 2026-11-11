@@ -203,13 +203,29 @@ async fn runtime_main(
     };
     let _ = ready.send(Ok(identity));
 
+    // The mini app's Chat tab is restored from cache/mirror-<chat>.json by
+    // `webapp::install` (a bot token cannot call messages.getHistory, so the
+    // Bot API is not an option) and kept up to date by `mirror_to_miniapp`.
+
     // Update pump: convert each Update and fan out to the registered handlers.
+    //
+    // The stream can end (network blip, a `getDifference` the client cannot
+    // apply, a flood-wait that closes the socket). It used to be pumped once:
+    // when it died, every later message — including everything typed inside
+    // the voice chat — silently stopped reaching the mini app. Re-subscribe
+    // forever instead, and say so in the log.
     let pump_client = client.clone();
     let pump_shared = shared.clone();
     tokio::spawn(async move {
-        let mut stream = pump_client.stream_updates();
-        while let Some(upd) = stream.next().await {
-            dispatch_update(&upd, &pump_shared, &pump_client).await;
+        loop {
+            {
+                let mut stream = pump_client.stream_updates();
+                while let Some(upd) = stream.next().await {
+                    dispatch_update(&upd, &pump_shared, &pump_client).await;
+                }
+            }
+            crate::parv_warn!("updates", "update stream ended, resubscribing in 3s");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
 
@@ -278,6 +294,9 @@ async fn dispatch_update(upd: &Update, shared: &Arc<Mutex<Shared>>, client: &Cli
             for h in &msgs {
                 h(&msg);
             }
+            // Mirror the group's chat into the mini app (names, avatars,
+            // stickers, replies) — skipped unless it is the mirrored chat.
+            mirror_to_miniapp(m, &msg);
         }
         Update::CallbackQuery(cb) => {
             let tg = callback_to_callback(cb, client).await;
@@ -380,6 +399,186 @@ async fn incoming_to_message(
         first_name,
         last_name,
         ..Default::default()
+    }
+}
+
+/// Flattens the TL media payload into (kind, sticker-emoji, cache-key, size).
+fn media_info(m: &ferogram::update::IncomingMessage) -> (String, String, String, i64) {
+    let media = match &m.raw {
+        tl::enums::Message::Message(mm) => mm.media.as_ref(),
+        _ => None,
+    };
+    match media {
+        Some(tl::enums::MessageMedia::Document(d)) => {
+            if let Some(tl::enums::Document::Document(doc)) = &d.document {
+                let mut emoji = String::new();
+                let mut sticker = false;
+                for a in &doc.attributes {
+                    if let tl::enums::DocumentAttribute::Sticker(s) = a {
+                        emoji = s.alt.clone();
+                        sticker = true;
+                    }
+                }
+                let kind = if sticker {
+                    "sticker"
+                } else if d.voice || d.round {
+                    "voice"
+                } else if d.video {
+                    "video"
+                } else {
+                    "document"
+                };
+                return (
+                    kind.to_string(),
+                    emoji,
+                    format!("m{}", doc.id),
+                    doc.size,
+                );
+            }
+            ("document".into(), String::new(), String::new(), 0)
+        }
+        Some(tl::enums::MessageMedia::Photo(p)) => {
+            if let Some(tl::enums::Photo::Photo(ph)) = &p.photo {
+                return ("photo".into(), String::new(), format!("p{}", ph.id), 4 * 1024 * 1024);
+            }
+            ("photo".into(), String::new(), String::new(), 0)
+        }
+        Some(tl::enums::MessageMedia::Empty) | None => {
+            ("text".into(), String::new(), String::new(), 0)
+        }
+        _ => ("document".into(), String::new(), String::new(), 0),
+    }
+}
+
+/// TL entities → the `{type, offset, length}` shape the mini app renders.
+fn entities_json(m: &ferogram::update::IncomingMessage) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let ents = match &m.raw {
+        tl::enums::Message::Message(mm) => mm.entities.clone().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for e in ents {
+        let (kind, extra): (&str, serde_json::Value) = match &e {
+            tl::enums::MessageEntity::Bold(_) => ("bold", json!(null)),
+            tl::enums::MessageEntity::Italic(_) => ("italic", json!(null)),
+            tl::enums::MessageEntity::Underline(_) => ("underline", json!(null)),
+            tl::enums::MessageEntity::Strike(_) => ("strikethrough", json!(null)),
+            tl::enums::MessageEntity::Code(_) => ("code", json!(null)),
+            tl::enums::MessageEntity::Pre(p) => ("pre", json!(p.language)),
+            tl::enums::MessageEntity::Spoiler(_) => ("spoiler", json!(null)),
+            tl::enums::MessageEntity::Blockquote(_) => ("blockquote", json!(null)),
+            tl::enums::MessageEntity::Url(_) => ("url", json!(null)),
+            tl::enums::MessageEntity::TextUrl(u) => ("text_link", json!(u.url)),
+            tl::enums::MessageEntity::Mention(_) => ("mention", json!(null)),
+            tl::enums::MessageEntity::Hashtag(_) => ("hashtag", json!(null)),
+            tl::enums::MessageEntity::CustomEmoji(c) => {
+                ("custom_emoji", json!(c.document_id.to_string()))
+            }
+            _ => continue,
+        };
+        let (offset, length) = match &e {
+            tl::enums::MessageEntity::Bold(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Italic(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Underline(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Strike(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Code(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Pre(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Spoiler(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Blockquote(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Url(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::TextUrl(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Mention(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::Hashtag(x) => (x.offset, x.length),
+            tl::enums::MessageEntity::CustomEmoji(x) => (x.offset, x.length),
+            _ => continue,
+        };
+        out.push(json!({
+            "type": kind,
+            "offset": offset,
+            "length": length,
+            "extra": extra,
+        }));
+    }
+    out
+}
+
+fn hhmm(date: i32) -> String {
+    let off: i64 = std::env::var("TZ_OFFSET_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(330);
+    let secs = (date as i64 + off * 60).rem_euclid(86_400);
+    format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+}
+
+/// Mirror one group message into the mini app's Chat tab. Media is fetched
+/// over MTProto in the background so the update pump never blocks on a
+/// sticker download.
+fn mirror_to_miniapp(m: &ferogram::update::IncomingMessage, msg: &TgMessage) {
+    if msg.is_private || msg.is_channel {
+        return;
+    }
+    if !crate::webapp::tracks_chat(msg.chat_id) {
+        return;
+    }
+    crate::parv_info!(
+        "mirror",
+        "chat={} mid={} from={} out={} kind={} len={}",
+        msg.chat_id,
+        msg.id,
+        msg.sender_id,
+        m.outgoing(),
+        msg.text.chars().count(),
+        msg.text.len()
+    );
+    let date = match &m.raw {
+        tl::enums::Message::Message(mm) => mm.date,
+        _ => 0,
+    };
+    let (kind, emoji, key, size) = media_info(m);
+    let base = crate::webapp::ChatEvent {
+        chat_id: msg.chat_id,
+        mid: msg.id,
+        sender_id: msg.sender_id,
+        name: format!("{} {}", msg.first_name, msg.last_name).trim().to_string(),
+        text: msg.text.clone(),
+        kind: kind.clone(),
+        emoji,
+        media: String::new(),
+        media_kind: String::new(),
+        reply_to: msg.reply_to,
+        date: date as i64,
+        ts: hhmm(date),
+        outgoing: m.outgoing(),
+        entities: entities_json(m),
+    };
+    if (kind == "sticker" || kind == "photo") && size > 0 && size <= 6 * 1024 * 1024 {
+        let m2 = m.clone();
+        let mut ev = base.clone();
+        tokio::spawn(async move {
+            if let Ok(bytes) = m2.bytes().await {
+                if !bytes.is_empty() && bytes.len() <= 6 * 1024 * 1024 {
+                    // Stickers come as WebP (static), WebM (video) or a
+                    // gzipped Lottie `.tgs`; tell the client which one it is
+                    // so it can pick <img>, <video> or the Lottie player.
+                    ev.media_kind = if bytes.len() > 4 && bytes[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+                        "video".into()
+                    } else if bytes.len() > 2 && bytes[..2] == [0x1F, 0x8B] {
+                        "tgs".into()
+                    } else {
+                        "image".into()
+                    };
+                    let _ = std::fs::create_dir_all("cache/tg");
+                    if std::fs::write(format!("cache/tg/{key}.bin"), &bytes).is_ok() {
+                        ev.media = format!("/api/tgmedia/{key}");
+                    }
+                }
+            }
+            crate::webapp::ingest(ev);
+        });
+    } else {
+        crate::webapp::ingest(base);
     }
 }
 

@@ -12,7 +12,7 @@ use parvati_mtproto::client::Client as MtClient;
 use parvati_ntg::{media_from_file, MediaDesc, OnStreamEnd};
 
 #[allow(unused_imports)]
-use crate::{parv_debug, parv_error};
+use crate::{parv_debug, parv_error, parv_info};
 
 /// Abstraction over libntgcalls so tests (and the monitor) can drive the
 /// join state machine without a real voice engine.
@@ -257,7 +257,24 @@ impl Context {
             };
             return false;
         }
-        let call = match mt.get_group_call(chat_id) {
+        // A voice chat that nobody started yet is not an error: the assistant
+        // opens one (it is admin with "manage voice chats") and joins it, so
+        // /play and the mini app work in a fresh group too.
+        let mut call = match mt.ensure_group_call(chat_id, "🎵 Music Room") {
+            Ok(c) => Ok(c),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &call {
+            if e.contains("CHAT_ADMIN_REQUIRED") {
+                // The bot is an admin here, so it can hand the assistant the
+                // voice-chat right; retry once with that in place.
+                parv_info!("ubot", "promoting assistant for voice chats chat={chat_id}");
+                if crate::webapp::ensure_assistant_admin(chat_id) {
+                    call = mt.ensure_group_call(chat_id, "🎵 Music Room");
+                }
+            }
+        }
+        let call = match call {
             Ok(c) => c,
             Err(e) => {
                 parv_error!("ubot", "get_group_call failed chat={chat_id}: {e}");

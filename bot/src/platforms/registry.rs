@@ -76,6 +76,23 @@ pub fn search_tracks(query: &str, video: bool) -> Vec<Track> {
     lock().as_ref().map(|r| r.yt.get(query, video)).unwrap_or_default()
 }
 
+/// Catalogue search through the Iota API. Empty when the backend is not
+/// configured or is cooling down, so callers can simply merge what they get.
+pub fn iota_search(query: &str, limit: usize) -> Vec<Track> {
+    lock().as_ref().map(|r| r.iota.search(query, limit)).unwrap_or_default()
+}
+
+/// True when at least one Iota backend is configured.
+pub fn iota_active() -> bool {
+    lock().as_ref().map(|r| r.iota.active()).unwrap_or(false)
+}
+
+/// Path of an already-downloaded copy of `track` (empty when absent). Lets a
+/// replay skip the downloader entirely.
+pub fn cached_path(track: &Track) -> String {
+    lock().as_ref().map(|r| r.iota.cached_path(track)).unwrap_or_default()
+}
+
 /// download_track: priority order, "<Platform>: <err>"
 /// last-error strings, "no downloader for source: <src>" fallback.
 pub fn download_track(

@@ -19,6 +19,8 @@ pub struct Config {
     pub yuki_api_url: String,
     pub yuki_api_key: String,
     pub iota_api_url: String,
+    /// Extra Iota-compatible backends tried in order when the primary fails.
+    pub iota_api_fallback: Vec<String>,
     pub iota_api_key: String,
     pub default_lang: String,
     pub duration_limit: i64,
@@ -101,6 +103,7 @@ impl Default for Config {
             yuki_api_url: String::new(),
             yuki_api_key: String::new(),
             iota_api_url: String::new(),
+            iota_api_fallback: Vec::new(),
             iota_api_key: String::new(),
             default_lang: String::new(),
             duration_limit: 0,
@@ -196,6 +199,11 @@ pub fn load_from(dotenv: &str) -> Result<Config, String> {
             }
         },
         iota_api_url: getenv_str("IOTA_API_URL", "http://127.0.0.1:8000"),
+        iota_api_fallback: getenv_str("IOTA_API_FALLBACK", "")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
         iota_api_key: getenv_str("IOTA_API_KEY", ""),
         default_lang: getenv_str("DEFAULT_LANG", "en"),
         duration_limit: getenv_i64("DURATION_LIMIT", 9000),

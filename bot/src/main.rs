@@ -71,6 +71,12 @@ fn main() {
     let rooms = Rooms::new();
     let rx = modules::init(&mut tg, assists.clone(), rooms.clone(), loc, cfg.clone());
 
+    // (8b) mini app bridge: serves miniapp/ plus a JSON API over the same
+    // room state (set MINIAPP_CHAT_ID to the voice chat it should control).
+    parvati_bot::webapp::set_bot_id(tg.me_id());
+    parvati_bot::webapp::install_assistants(assists.clone());
+    parvati_bot::webapp::install(rooms.clone());
+
     // bot becomes the shared handle monitor threads and the pump loop
     // lock around.
     let bot: Arc<Mutex<Box<dyn Bot>>> = Arc::new(Mutex::new(Box::new(tg)));

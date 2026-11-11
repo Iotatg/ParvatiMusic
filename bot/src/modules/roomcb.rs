@@ -450,7 +450,11 @@ pub fn handle_room_cb(bot: &mut dyn Bot, cb: &TgCallback, sink: &dyn PlaySink) {
         }
         "stop" => {
             let id = r.lock().unwrap_or_else(|e| e.into_inner()).id;
-            rooms.drop_room(id);
+            // Same path as /end: stream off, leave the call, chat cleared.
+            let who = trim(&format!("{} {}", cb.first_name, cb.last_name)).to_string();
+            if !crate::webapp::end_session(id, cb.user_id, &who, "end") {
+                rooms.drop_room(id);
+            }
             let _ = bot.answer_callback(cb.query_id, &f(l, chat_id, "cb_stop_success"), true);
             card_edit(
                 bot,

@@ -15,6 +15,7 @@ pub mod modules;
 pub mod platforms;
 pub mod room;
 pub mod utils;
+pub mod webapp;
 
 pub mod prelude {
     pub use crate::config::Config;

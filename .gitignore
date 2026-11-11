@@ -6,3 +6,10 @@ lib/
 native/
 downloads/
 cache/
+logs/
+tools/cookies.txt
+__pycache__/
+*.pyc
+*.visual
+.cover_*.jpg
+*.log
