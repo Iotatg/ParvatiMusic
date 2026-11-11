@@ -87,6 +87,23 @@
   let replyTarget = null;
   let unread = 0;
   let chatSig = '';
+  /// A long-press or a swipe consumes the click that follows it, so the
+  /// tap-to-reply / double-tap-to-react handler must ignore that one event.
+  let suppressUntil = 0;
+  let suppressGridClick = false;
+  /// Shared by the tap / double-tap / long-press / swipe handlers so a swipe
+  /// or a long-press never also fires the plain tap-to-reply action.
+  let lastTap = { id: '', at: 0 };
+  /// Everything social that is not part of the room snapshot: the open
+  /// profile, the message in the action menu, the sticker being previewed,
+  /// the message being forwarded, and this viewer's saved sticker list.
+  const social = {
+    profile: null,
+    msgMenu: null,
+    sticker: null,
+    forward: null,
+    savedStickers: [],
+  };
   /// 'vc' = only people currently in the voice chat (the room's own chat),
   /// 'all' = every mirrored group message.
   let chatScope = 'vc';
@@ -154,6 +171,7 @@
       if (!viewer) viewer = { id: '42', name: 'you', username: 'you', photo: '' };
       setInterval(() => { if (!state.playback.paused && state.playback.track) localPos += 1; }, 1000);
     }
+    loadSavedStickers();
     renderAll();
   }
 
@@ -249,6 +267,8 @@
   /* ────────────────────────── tags ────────────────────────── */
   const memberById = (id) => state.members.find(m => String(m.id) === String(id));
   const myTags = () => memberById(viewer?.id)?.tags || [{ k: 'member', label: 'MEMBER' }];
+  const amAdmin = () => (memberById(viewer?.id)?.tags || [])
+    .some(t => t.k === 'owner' || t.k === 'admin' || t.k === 'host');
   const tagHTML = (tags, max = 3) => (tags || [])
     .slice(0, max)
     .map(t => `<span class="tag ${esc(t.k)}">${esc(t.label)}</span>`)
@@ -836,20 +856,25 @@
   }
 
   function stickerHTML(m) {
+    // The little + is the "Add to Stickers" affordance. It is pinned to the
+    // bubble (hence position:relative here) and its click is handled before
+    // the generic tap-to-reply gesture in bind().
+    const save = `<button class="sticker-save" data-sticker-save="${esc(m.id)}" aria-label="Add to Stickers"><svg class="ic"><use href="#i-plus"/></svg></button>`;
+    const wrap = (inner) => `<div class="bubble sticker" style="position:relative">${save}${inner}</div>`;
     if (!m.media) {
-      return `<div class="bubble sticker"><span style="font-size:58px;line-height:1">${esc(m.emoji || '🎵')}</span></div>`;
+      return wrap(`<span style="font-size:58px;line-height:1">${esc(m.emoji || '🎵')}</span>`);
     }
     const kind = m.media_kind || 'image';
     if (kind === 'video') {
-      return `<div class="bubble sticker"><video class="sticker-vid" src="${esc(m.media)}"
-        autoplay loop muted playsinline webkit-playsinline></video></div>`;
+      return wrap(`<video class="sticker-vid" src="${esc(m.media)}"
+        autoplay loop muted playsinline webkit-playsinline></video>`);
     }
     if (kind === 'tgs') {
-      return `<div class="bubble sticker"><div class="tgs-box" data-tgs="${esc(m.media)}"
-        data-emoji="${esc(m.emoji || '🎵')}"></div></div>`;
+      return wrap(`<div class="tgs-box" data-tgs="${esc(m.media)}"
+        data-emoji="${esc(m.emoji || '🎵')}"></div>`);
     }
-    return `<div class="bubble sticker"><img src="${esc(m.media)}" alt="${esc(m.emoji || '')}"
-      data-emoji="${esc(m.emoji || '')}" /></div>`;
+    return wrap(`<img src="${esc(m.media)}" alt="${esc(m.emoji || '')}"
+      data-emoji="${esc(m.emoji || '')}" draggable="false" />`);
   }
 
   /// Telegram's animated stickers are gzipped Lottie JSON (`.tgs`). Unpack in
@@ -918,8 +943,8 @@
           </div>`;
       } else if (m.kind === 'photo') {
         inner = m.media
-          ? `<div class="bubble media"><img src="${esc(m.media)}" alt="" /></div>`
-          : `<div class="bubble media"><img src="${coverURI(m.name || 'photo')}" alt="" /></div>`;
+          ? `<div class="bubble media"><img src="${esc(m.media)}" alt="" draggable="false" /></div>`
+          : `<div class="bubble media"><img src="${coverURI(m.name || 'photo')}" alt="" draggable="false" /></div>`;
       } else if (m.kind === 'sticker') {
         inner = stickerHTML(m);
       } else {
@@ -931,8 +956,9 @@
       const head = mine
         ? ''
         : `<div class="msg-head"><b>${esc(m.name || 'member')}</b>${tagHTML(tags, 2)}<span class="stamp">${esc(m.ts || '')}</span></div>`;
-      return `<div class="msg ${mine ? 'out' : 'in'}" data-id="${esc(m.id)}" data-mid="${m.mid || 0}">
-          ${mine ? '' : `<img class="msg-av" src="${esc(pic(m.photo, m.name))}" data-name="${esc(m.name || '?')}" alt="" loading="lazy" decoding="async" />`}
+      return `<div class="msg ${mine ? 'out' : 'in'}" data-id="${esc(m.id)}" data-mid="${m.mid || 0}" data-from="${esc(m.from || '')}">
+          <span class="swipe-hint"><svg class="ic"><use href="#i-reply"/></svg></span>
+          ${mine ? '' : `<img class="msg-av" src="${esc(pic(m.photo, m.name))}" data-name="${esc(m.name || '?')}" alt="" loading="lazy" decoding="async" draggable="false" />`}
           <div class="msg-col">
             ${head}
             ${inner}
@@ -999,6 +1025,7 @@
 
   /* ────────────────────────── tabs ────────────────────────── */
   function switchTab(tab) {
+    closeSocial();
     activeTab = tab;
     $('#app').dataset.tab = tab;
     $('#screen').dataset.tab = tab;
@@ -1164,10 +1191,13 @@
     // Use the sticker document itself, not its static thumbnail: the Bot API
     // proxy answers with WebP / WebM / gzip `.tgs`, and media_kind tells the
     // bubble which renderer to use.
-    const kind = s.video ? 'video' : s.animated ? 'tgs' : 'image';
+    // A sticker out of a public pack carries file_id; one mirrored from the
+    // group only has cached bytes under a mediaKey. Saved stickers keep both
+    // fields so they can be resent from the Saved tab unchanged.
+    const kind = s.media_kind || (s.video ? 'video' : s.animated ? 'tgs' : 'image');
     const media = s.file_id
       ? `/api/tgimg?fid=${encodeURIComponent(s.file_id)}`
-      : (thumb || s.thumb);
+      : (thumb || s.thumb || s.media);
     const local = {
       id: `l${Date.now()}`, mid: 0, from: viewer.id, name: viewer.name, photo: viewer.photo,
       tags: myTags(), mine: true, kind: 'sticker', text: '', emoji: s.emoji,
@@ -1181,8 +1211,8 @@
     $('#stickerPanel').classList.remove('is-on');
     try {
       const res = await api('/api/chat/send', {
-        kind: 'sticker', sticker: s.file_id, thumb: thumb || s.thumb, emoji: s.emoji,
-        media, media_kind: kind,
+        kind: 'sticker', sticker: s.file_id || '', thumb: thumb || s.thumb || s.media,
+        emoji: s.emoji, media, media_kind: kind, mediaKey: s.mediaKey || '',
         senderId: viewer.id, senderName: viewer.name, tags: myTags(),
       });
       if (res.message) {
@@ -1235,9 +1265,37 @@
 
   async function renderPane() {
     $$('.sticker-tab').forEach(t => t.classList.toggle('is-on', t.dataset.pane === pane));
-    const packs = pane === 'premium' ? PREMIUM_PACKS : pane === 'sticker' ? STICKER_PACKS : null;
     const packRow = $('#stickerPacks');
     const grid = $('#stickerGrid');
+
+    // "Saved" is the viewer's own "Add to Stickers" list. It never touches
+    // Telegram, so it opens instantly and also works when the bridge is busy.
+    if (pane === 'saved') {
+      packRow.hidden = true;
+      grid.classList.add('packs');
+      grid.dataset.set = '';
+      const list = social.savedStickers;
+      if (!list.length) {
+        grid.innerHTML = `<div class="saved-empty">
+            <svg class="ic"><use href="#i-bookmark"/></svg>
+            <b>No saved stickers yet</b>
+            <span>Tap the small + on any sticker in the chat to keep it here.</span>
+          </div>`;
+        return;
+      }
+      grid.innerHTML = list.map((s, i) => {
+        const kind = s.media_kind || 'image';
+        const inner = kind === 'video'
+          ? `<video src="${esc(s.media || '')}" autoplay loop muted playsinline webkit-playsinline></video>`
+          : (kind === 'tgs' || !s.media)
+            ? `<span class="sd-emoji">${esc(s.emoji || '🎵')}</span>`
+            : `<img src="${esc(s.media)}" loading="lazy" alt="${esc(s.emoji || '')}" />`;
+        return `<button class="sticker-cell" data-saved="${i}" title="${esc(s.emoji || '')}">${inner}</button>`;
+      }).join('');
+      return;
+    }
+
+    const packs = pane === 'premium' ? PREMIUM_PACKS : pane === 'sticker' ? STICKER_PACKS : null;
 
     if (!packs) {
       packRow.hidden = true;
@@ -1523,6 +1581,10 @@
     const m = ctxMember;
     closeCtx();
     haptic('medium');
+    if (act === 'profile') {
+      openProfile(m.id);
+      return;
+    }
     if (act === 'dm') {
       dm.open = true;
       $('#dmSheet').classList.add('is-open');
@@ -1599,7 +1661,10 @@
   }
 
   /* ────────────────────────── private chat ────────────────────────── */
-  const dmPeer = () => memberById(dm.peer);
+  // A profile card can open a private chat with somebody who is not in the
+  // visible roster yet; keep their details so the DM header is not blank.
+  const dmPeer = () => memberById(dm.peer)
+    || (social.profile && String(social.profile.id) === String(dm.peer) ? social.profile : null);
 
   async function openDm() {
     dm.open = true;
@@ -1816,6 +1881,410 @@
     $('#scrim').classList.remove('is-on');
   }
 
+  /* ─────────────────── social: shared overlays ─────────────────── */
+  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet'];
+
+  function closeSocial() {
+    SOCIAL_SHEETS.forEach(s => { const el = $(s); if (el) el.classList.remove('is-open'); });
+    $('#scrim').classList.remove('is-on');
+  }
+
+  function openSocial(sel) {
+    // Only one overlay at a time. Closing the others clears the shared scrim,
+    // which is put straight back under the freshly opened sheet.
+    closeCtx(); closeSheet(); closeInvite(); closePick(); closeSocial();
+    $(sel).classList.add('is-open');
+    $('#scrim').classList.add('is-on');
+  }
+
+  async function loadSavedStickers() {
+    if (!online || !viewer?.id) return;
+    try {
+      const r = await api(`/api/stickers/saved?me=${encodeURIComponent(viewer.id)}`);
+      social.savedStickers = r.stickers || [];
+      if (pane === 'saved') renderPane();
+    } catch { social.savedStickers = []; }
+  }
+
+  /* ─────────────────── user profile card ─────────────────── */
+  async function openProfile(id) {
+    id = String(id || '');
+    if (!id || id === 'bot') return;
+    closeCtx();
+    haptic('light');
+    let u = null;
+    if (online) {
+      try { u = await api(`/api/user?id=${encodeURIComponent(id)}`); } catch {}
+    }
+    // Bridge offline? Still show everything the roster already knows.
+    u = u || memberById(id) || { id, name: 'member', tags: [{ k: 'member', label: 'MEMBER' }] };
+    social.profile = { ...u, id, photo: u.photo || `/api/avatar/${id}` };
+    paintProfile(social.profile);
+    openSocial('#profileSheet');
+  }
+
+  function paintProfile(u) {
+    const isMe = String(u.id) === String(viewer?.id);
+    const av = $('#profAv');
+    av.src = u.photo_big || u.photo || avatarURI(u.name);
+    av.dataset.name = u.name || '?';
+    $('#profName').textContent = u.name || 'member';
+    $('#profHandle').textContent = u.username ? `@${u.username}` : `id ${u.id}`;
+    $('#profTags').innerHTML = tagHTML(u.tags || [{ k: 'member', label: 'MEMBER' }], 3);
+    const bio = (u.bio || '').trim();
+    $('#profBio').hidden = !bio;
+    $('#profBio').textContent = bio;
+    const stats = [
+      { v: u.messages ?? '–', l: 'Messages here' },
+      { v: u.in_voice ? 'In call' : 'Away', l: 'Voice chat' },
+      { v: u.last_seen || '–', l: 'Last message' },
+    ];
+    $('#profStats').innerHTML = stats.map(s =>
+      `<div class="prof-stat"><b>${esc(String(s.v))}</b><span>${esc(s.l)}</span></div>`).join('');
+
+    const quick = (act) => $(`#profileSheet [data-prof="${act}"]`);
+    const dm = quick('dm'), mention = quick('mention'), tg = quick('tg');
+    if (dm) dm.hidden = isMe || !!u.bot;
+    if (mention) mention.hidden = isMe;
+    if (tg) tg.hidden = !u.username;
+
+    const rows = [];
+    if (u.username) rows.push({ ic: '#i-at', label: `@${u.username}`, hint: 'Username · tap to copy', copy: `@${u.username}` });
+    rows.push({ ic: '#i-info', label: `User ID · ${u.id}`, hint: 'Telegram account id · tap to copy', copy: String(u.id) });
+    if (u.premium) rows.push({ ic: '#i-info', label: 'Telegram Premium', hint: 'This account has Premium' });
+    if (u.username) rows.push({ ic: '#i-external', label: 'Open in Telegram', hint: `t.me/${u.username}`, act: 'tg' });
+    if (!isMe && !u.bot) rows.push({ ic: '#i-lock', label: 'Send private message', hint: 'Only the two of you can read it', act: 'dm' });
+    $('#profRows').innerHTML = rows.length
+      ? rows.map(r => {
+          const attr = r.copy ? `data-prof-copy="${esc(r.copy)}"`
+            : (r.act ? `data-prof="${esc(r.act)}"` : '');
+          return `<div class="sheet-row" ${attr}>
+            <span class="invite-row-ic"><svg class="ic"><use href="${r.ic}"/></svg></span>
+            <div style="flex:1;min-width:0">
+              <div class="lbl">${esc(r.label)}</div>
+              <div class="hint">${esc(r.hint)}</div>
+            </div>
+            <svg class="ic" style="width:12px;height:12px;color:#55565c"><use href="#i-chevron"/></svg>
+          </div>`;
+        }).join('')
+      : '<div class="prof-none">Only public Telegram details are shown.</div>';
+  }
+
+  function profileAction(act) {
+    const u = social.profile;
+    if (!u) return;
+    if (act === 'dm') {
+      closeSocial();
+      dm.open = true;
+      $('#dmSheet').classList.add('is-open');
+      openDmThread(String(u.id));
+      haptic('light');
+      return;
+    }
+    if (act === 'mention') {
+      closeSocial();
+      switchTab('chat');
+      const name = u.username ? `@${u.username}` : (u.name || 'member');
+      insertNode(document.createTextNode(`${name} `));
+      editor().focus();
+      haptic('light');
+      return;
+    }
+    if (act === 'tg') {
+      if (u.username) openTelegram(`https://t.me/${u.username}`);
+      else toast('No public username');
+    }
+  }
+
+  /* ─────────────────── stickers: save / resend ─────────────────── */
+  // Turn a chat message into a portable sticker record. Mirrored stickers
+  // point at /api/tgmedia/<key> (cached MTProto bytes), pack stickers at
+  // /api/tgimg?fid=<file_id>. Keep both so resending always works.
+  function stickerFromMessage(m) {
+    const media = m.media || '';
+    let fileId = '', mediaKey = '';
+    const mTg = media.match(/\/api\/tgmedia\/([A-Za-z0-9_.\-]+)/);
+    const mFid = media.match(/[?&]fid=([^&]+)/);
+    if (mTg) mediaKey = mTg[1];
+    if (mFid) { try { fileId = decodeURIComponent(mFid[1]); } catch { fileId = mFid[1]; } }
+    return {
+      id: `sv_${m.id || m.mid || Date.now()}`,
+      emoji: m.emoji || '🎵',
+      media,
+      media_kind: m.media_kind || 'image',
+      file_id: fileId,
+      mediaKey,
+      thumb: m.sticker || m.media || '',
+      set: m.set || '',
+    };
+  }
+
+  function openStickerDetail(stk, fromSaved = false) {
+    if (!stk) return;
+    social.sticker = { ...stk, fromSaved };
+    const kind = stk.media_kind || 'image';
+    const prev = $('#sdPreview');
+    if (kind === 'video' && stk.media) {
+      prev.innerHTML = `<video src="${esc(stk.media)}" autoplay loop muted playsinline webkit-playsinline></video>`;
+    } else if (kind === 'tgs' || !stk.media) {
+      prev.innerHTML = `<span class="sd-emoji">${esc(stk.emoji || '🎵')}</span>`;
+    } else {
+      prev.innerHTML = `<img src="${esc(stk.media)}" alt="${esc(stk.emoji || '')}" />`;
+    }
+    $('#sdTitle').textContent = stk.emoji ? `Sticker ${stk.emoji}` : 'Sticker';
+    $('#sdSub').textContent = fromSaved
+      ? 'Saved in your personal stickers — send it in one tap.'
+      : 'Save it to your stickers and send it in one tap.';
+    $('#sdSave').hidden = !!fromSaved;
+    $('#sdRemove').hidden = !fromSaved;
+    openSocial('#stickerSheet');
+    haptic('light');
+  }
+
+  async function saveStickerQuick(m) {
+    social.sticker = stickerFromMessage(m);
+    await saveStickerNow();
+  }
+
+  async function saveStickerNow() {
+    const stk = social.sticker;
+    if (!stk || !viewer?.id) return;
+    try {
+      const r = await api('/api/stickers/saved', {
+        me: viewer.id, action: 'add',
+        sticker: {
+          id: stk.id, emoji: stk.emoji, media: stk.media,
+          media_kind: stk.media_kind, file_id: stk.file_id || '',
+          mediaKey: stk.mediaKey || '', thumb: stk.thumb || stk.media, set: stk.set || '',
+        },
+      });
+      social.savedStickers = r.stickers || social.savedStickers;
+      closeSocial();
+      toast('Added to Stickers');
+      if (pane === 'saved') renderPane();
+    } catch (e) { toast(`Could not save: ${e.message}`); }
+  }
+
+  async function removeStickerNow() {
+    const stk = social.sticker;
+    if (!stk || !viewer?.id) return;
+    try {
+      const r = await api('/api/stickers/saved', { me: viewer.id, action: 'remove', id: stk.id });
+      social.savedStickers = r.stickers || [];
+      closeSocial();
+      toast('Removed from Saved');
+      if (pane === 'saved') renderPane();
+    } catch (e) { toast(`Could not remove: ${e.message}`); }
+  }
+
+  /* ─────────────────── message action menu ─────────────────── */
+  function msgPreview(m) {
+    if (!m) return '';
+    return m.kind === 'sticker' ? `Sticker ${m.emoji || ''}`.trim()
+      : m.kind === 'photo' ? 'Photo'
+      : m.kind === 'voice' ? 'Voice message'
+      : (m.text || '').slice(0, 160) || 'Message';
+  }
+
+  function openMsgMenu(m) {
+    if (!m) return;
+    social.msgMenu = m;
+    $('#actPreview').innerHTML = `<b>${esc(m.mine ? 'You' : (m.name || 'member'))}</b>${esc(msgPreview(m))}`;
+    const acts = [
+      { k: 'reply', label: 'Reply', ic: '#i-reply' },
+      { k: 'copy', label: 'Copy text', ic: '#i-copy', show: !!m.text },
+      { k: 'forward', label: 'Forward', ic: '#i-forward' },
+      { k: 'saveSticker', label: 'Add to Stickers', ic: '#i-bookmark', show: m.kind === 'sticker' },
+      { k: 'react', label: 'React ❤️', ic: '#i-heart' },
+      { k: 'profile', label: 'View profile', ic: '#i-user', show: !m.mine && !!m.from && m.from !== 'bot' },
+      { k: 'delete', label: 'Delete', ic: '#i-trash', danger: true,
+        show: !!m.mid && online && (m.mine || amAdmin()) },
+    ].filter(a => a.show !== false);
+    $('#actGrid').innerHTML = acts.map(a => `
+      <button class="act-btn ${a.danger ? 'danger' : ''}" data-msg-act="${a.k}">
+        <svg class="ic"><use href="${a.ic}"/></svg><span>${esc(a.label)}</span>
+      </button>`).join('');
+    openSocial('#msgMenu');
+    haptic('medium');
+  }
+
+  function msgAction(act) {
+    const m = social.msgMenu;
+    if (!m) return;
+    closeSocial();
+    switch (act) {
+      case 'reply': setReply(m); break;
+      case 'copy': copyText(m.text || ''); break;
+      case 'forward': openForward(m); break;
+      case 'saveSticker': saveStickerQuick(m); break;
+      case 'react': react(m, '❤️'); break;
+      case 'profile': openProfile(m.from); break;
+      case 'delete': deleteMsg(m); break;
+    }
+  }
+
+  async function deleteMsg(m) {
+    const run = async () => {
+      try {
+        await api('/api/chat/delete', { mid: m.mid });
+        state.messages = state.messages.filter(x => String(x.id) !== String(m.id));
+        chatSig = sigOf(state.messages);
+        renderChat(true);
+        toast('Message deleted');
+      } catch (e) { toast(`Delete failed: ${e.message}`); }
+    };
+    let asked = false;
+    try {
+      if (tg?.showPopup) {
+        tg.showPopup({
+          title: 'Delete message',
+          message: 'Delete this message in the group and the mirrored chat?',
+          buttons: [
+            { id: 'cancel', type: 'cancel' },
+            { id: 'ok', type: 'destructive', text: 'Delete' },
+          ],
+        }, (id) => { if (id === 'ok') run(); });
+        asked = true;
+      }
+    } catch {}
+    if (!asked) run();
+  }
+
+  /* ─────────────────── forward to a private chat ─────────────────── */
+  function openForward(m) {
+    if (!m) return;
+    social.forward = m;
+    $('#forwardSub').textContent = `“${(msgPreview(m) || '').slice(0, 60)}” — a private copy, never posted to the group.`;
+    const people = state.members
+      .filter(x => String(x.id) !== String(viewer?.id) && !x.bot)
+      .sort((a, b) => (b.vc ? 1 : 0) - (a.vc ? 1 : 0));
+    $('#forwardList').innerHTML = people.length
+      ? people.map(p => `<button class="forward-row" data-forward="${esc(p.id)}">
+          <img class="avatar" src="${esc(pic(p.photo, p.name))}" data-name="${esc(p.name)}" alt="" />
+          <span><b>${esc(p.name)}</b><span>${p.username ? '@' + esc(p.username) : 'private chat'}</span></span>
+          <svg class="ic" style="width:12px;height:12px;color:#55565c"><use href="#i-chevron"/></svg>
+        </button>`).join('')
+      : '<div class="prof-none">No members to forward to yet.</div>';
+    openSocial('#forwardSheet');
+  }
+
+  async function forwardTo(peer) {
+    const m = social.forward;
+    if (!m || !peer || !viewer?.id) return;
+    closeSocial();
+    const head = m.name && !m.mine ? `Forwarded from ${m.name}:\n` : '';
+    const text = `${head}${msgPreview(m)}`.slice(0, 1000);
+    try {
+      await api('/api/dm/send', { me: viewer.id, peer: String(peer), text });
+      toast('Forwarded privately');
+    } catch (e) { toast(`Forward failed: ${e.message}`); }
+  }
+
+  /* ─────────────────── jump to a replied message ─────────────────── */
+  function jumpToMessage(m) {
+    if (!m?.reply?.mid) { toast('Original message not linked'); return; }
+    const target = state.messages.find(x => x.mid && String(x.mid) === String(m.reply.mid));
+    if (!target) { toast('Original message is not in this view'); return; }
+    const el = $$('#msgs .msg').find(x => x.dataset.id === String(target.id));
+    if (!el) { toast('Switch to Everyone to see that message'); return; }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('is-highlight');
+    void el.offsetWidth;
+    el.classList.add('is-highlight');
+    setTimeout(() => el.classList.remove('is-highlight'), 1200);
+  }
+
+  /* ─────────────────── chat gestures ─────────────────── */
+  // Telegram-like: horizontal swipe → reply, long-press → action menu,
+  // plain tap → reply (existing), double-tap → ❤️ (existing). Vertical
+  // scrolling is left to the browser via `touch-action: pan-y` on .msg.
+  function wireChatGestures() {
+    const box = $('#msgs');
+    let g = null;
+
+    const settle = (el) => {
+      if (!el) return;
+      el.classList.remove('is-swiping');
+      el.style.transform = '';
+      const hint = el.querySelector('.swipe-hint');
+      if (hint) hint.style.opacity = '';
+    };
+
+    box.addEventListener('pointerdown', (e) => {
+      const el = e.target.closest('.msg');
+      if (!el || e.button === 2) return;
+      // Interactive children keep their own behaviour (profile, +, links).
+      if (e.target.closest('a, .sticker-save, .react-chip, .reply, .msg-av, .msg-head b')) return;
+      const m = state.messages.find(x => String(x.id) === el.dataset.id);
+      if (!m) return;
+      g = { id: e.pointerId, el, m, x0: e.clientX, y0: e.clientY, dx: 0, active: false, timer: null };
+      g.timer = setTimeout(() => {
+        if (!g || g.active) return;
+        const cur = g;
+        g = null;
+        clearTimeout(cur.timer);
+        suppressUntil = Date.now() + 500;   // swallow the click that follows
+        lastTap = { id: '', at: 0 };
+        haptic('medium');
+        openMsgMenu(cur.m);
+      }, 470);
+    });
+
+    box.addEventListener('pointermove', (e) => {
+      if (!g || e.pointerId !== g.id) return;
+      const dx = e.clientX - g.x0;
+      const dy = e.clientY - g.y0;
+      if (!g.active) {
+        if (Math.abs(dx) < 12) return;
+        if (Math.abs(dx) < Math.abs(dy) * 1.2) {   // vertical scroll — let it be
+          clearTimeout(g.timer); g = null; return;
+        }
+        g.active = true;
+        clearTimeout(g.timer);
+        try { g.el.setPointerCapture(e.pointerId); } catch {}
+        g.el.classList.add('is-swiping');
+        const hint = g.el.querySelector('.swipe-hint');
+        if (hint) hint.style.opacity = '1';
+      }
+      g.dx = clamp(dx, 0, 84);
+      g.el.style.transform = `translateX(${g.dx}px)`;
+    });
+
+    const end = (e) => {
+      if (!g || e.pointerId !== g.id) return;
+      clearTimeout(g.timer);
+      const cur = g;
+      g = null;
+      if (!cur.active) return;                     // plain tap → click handler
+      const fired = cur.dx > 54;
+      cur.el.classList.remove('is-swiping');
+      cur.el.classList.add('is-settling');
+      cur.el.style.transform = '';
+      const hint = cur.el.querySelector('.swipe-hint');
+      if (hint) hint.style.opacity = '';
+      setTimeout(() => cur.el && cur.el.classList.remove('is-settling'), 280);
+      suppressUntil = Date.now() + 450;           // swallow the trailing click
+      lastTap = { id: '', at: 0 };
+      if (fired) { haptic('light'); setReply(cur.m); }
+    };
+    box.addEventListener('pointerup', end);
+    box.addEventListener('pointercancel', (e) => {
+      if (!g || e.pointerId !== g.id) return;
+      clearTimeout(g.timer);
+      settle(g.el);
+      g = null;
+    });
+    box.addEventListener('contextmenu', (e) => {
+      if (e.target.closest('.msg')) e.preventDefault();
+    });
+    // A native HTML5 image drag cancels the pointer stream (pointercancel),
+    // which used to make swipe-to-reply silently fail on sticker/photo
+    // bubbles while working on text bubbles. Suppress it on chat media.
+    box.addEventListener('dragstart', (e) => {
+      if (e.target.closest('.msg')) e.preventDefault();
+    }, true);
+  }
+
   /* ────────────────────────── wiring ────────────────────────── */
   function bind() {
     $$('.tab').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
@@ -2025,6 +2494,7 @@
     $$('.sticker-tab').forEach(t => t.addEventListener('click', () => {
       pane = t.dataset.pane;
       renderPane();
+      if (pane === 'saved') loadSavedStickers();
     }));
     $('#stickerPacks').addEventListener('click', (e) => {
       const chip = e.target.closest('[data-pack]');
@@ -2033,8 +2503,17 @@
       renderPane();
     });
     $('#stickerGrid').addEventListener('click', async (e) => {
+      // A long-press on a Saved cell opens the remove sheet and consumes the
+      // click that follows it.
+      if (suppressGridClick) { suppressGridClick = false; return; }
       const em = e.target.closest('[data-emoji]');
       if (em) { insertEmoji(em.dataset.emoji); haptic('light'); return; }
+      const sv = e.target.closest('[data-saved]');
+      if (sv) {
+        const s = social.savedStickers[+sv.dataset.saved];
+        if (s) sendSticker(s, s.thumb || s.media);
+        return;
+      }
       const cell = e.target.closest('[data-sticker]');
       const prem = e.target.closest('[data-prem]');
       const set = packCache[$('#stickerGrid').dataset.set];
@@ -2042,16 +2521,41 @@
       if (cell) { sendSticker(set.stickers[+cell.dataset.sticker]); return; }
       if (prem) { insertPremium(set.stickers[+prem.dataset.prem]); haptic('light'); }
     });
+    let savedHold = null;
+    const clearSavedHold = () => { if (savedHold) { clearTimeout(savedHold); savedHold = null; } };
+    $('#stickerGrid').addEventListener('pointerdown', (e) => {
+      const c = e.target.closest('[data-saved]');
+      if (!c) return;
+      clearSavedHold();
+      savedHold = setTimeout(() => {
+        savedHold = null;
+        suppressGridClick = true;
+        const s = social.savedStickers[+c.dataset.saved];
+        if (s) openStickerDetail(s, true);
+      }, 480);
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
+      $('#stickerGrid').addEventListener(ev, clearSavedHold));
 
     $('#replyCancel').addEventListener('click', cancelReply);
 
-    // tap a message to reply, double-tap to react
-    let lastTap = { id: '', at: 0 };
+    // Tap targets, resolved before the plain tap-to-reply / double-tap-to-❤️
+    // path. A swipe or long-press raises suppressUntil so its trailing click
+    // never becomes a reply.
     $('#msgs').addEventListener('click', (e) => {
+      if (Date.now() < suppressUntil) return;
       const el = e.target.closest('.msg');
       if (!el) return;
       const m = state.messages.find(x => String(x.id) === el.dataset.id);
       if (!m) return;
+      if (e.target.closest('.msg-av, .msg-head b')) { openProfile(m.from); return; }
+      if (e.target.closest('.reply')) { jumpToMessage(m); return; }
+      if (e.target.closest('.react-chip')) { openMsgMenu(m); return; }
+      if (e.target.closest('.sticker-save, .bubble.sticker')) {
+        openStickerDetail(stickerFromMessage(m));
+        return;
+      }
+      if (e.target.closest('a')) return;         // links stay clickable
       const now = Date.now();
       if (lastTap.id === m.id && now - lastTap.at < 340) {
         react(m, '❤️');
@@ -2060,10 +2564,11 @@
       }
       lastTap = { id: m.id, at: now };
       setTimeout(() => {
-        if (lastTap.id !== m.id) return;
+        if (lastTap.id !== m.id || Date.now() < suppressUntil) return;
         setReply(m);
       }, 350);
     });
+    wireChatGestures();
 
     // ── members
     $('#memberList').addEventListener('click', (e) => {
@@ -2076,13 +2581,42 @@
       const menu = e.target.closest('[data-menu]');
       if (menu) { openCtx(menu.dataset.menu, menu); return; }
       const row = e.target.closest('.member');
-      if (row) openCtx(row.dataset.id, row);
+      if (row) openProfile(row.dataset.id);   // tap a member → profile card
     });
     $('#ctxMenu').addEventListener('click', (e) => {
       const b = e.target.closest('[data-act]');
       if (b) memberAction(b.dataset.act);
     });
-    $('#scrim').addEventListener('click', () => { closeCtx(); closeSheet(); closeInvite(); closePick(); });
+
+    // ── social v3: profile / message actions / sticker detail / forward
+    $('#profileSheet').addEventListener('click', (e) => {
+      if (e.target.closest('#profClose')) { closeSocial(); return; }
+      const cp = e.target.closest('[data-prof-copy]');
+      if (cp) { copyText(cp.dataset.profCopy); return; }
+      const q = e.target.closest('[data-prof]');
+      if (q) profileAction(q.dataset.prof);
+    });
+    $('#msgMenu').addEventListener('click', (e) => {
+      const r = e.target.closest('[data-react]');
+      if (r) { const m = social.msgMenu; closeSocial(); if (m) react(m, r.dataset.react); return; }
+      const a = e.target.closest('[data-msg-act]');
+      if (a) msgAction(a.dataset.msgAct);
+    });
+    $('#stickerSheet').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-sd]');
+      if (!b) return;
+      if (b.dataset.sd === 'save') saveStickerNow();
+      else if (b.dataset.sd === 'send') {
+        const s = social.sticker; closeSocial();
+        if (s) sendSticker(s, s.thumb || s.media);
+      } else if (b.dataset.sd === 'remove') removeStickerNow();
+    });
+    $('#forwardList').addEventListener('click', (e) => {
+      const r = e.target.closest('[data-forward]');
+      if (r) forwardTo(r.dataset.forward);
+    });
+
+    $('#scrim').addEventListener('click', () => { closeCtx(); closeSheet(); closeInvite(); closePick(); closeSocial(); });
     $('#btnInvite').addEventListener('click', () => openInvite());
     $('#inviteRows').addEventListener('click', (e) => {
       const row = e.target.closest('[data-inv]');
@@ -2209,7 +2743,7 @@
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') { closeSearch(); closeCtx(); closeSheet(); closeInvite(); closeDm(); closePick(); }
+      if (e.key === 'Escape') { closeSearch(); closeCtx(); closeSheet(); closeInvite(); closeDm(); closePick(); closeSocial(); }
     });
   }
 

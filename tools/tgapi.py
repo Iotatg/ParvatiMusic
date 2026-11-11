@@ -14,10 +14,13 @@ Endpoints (all JSON unless noted)
     GET  /chat?chat_id=            chat title / username / member count
     GET  /admins?chat_id=          owner + administrators (+ custom titles)
     GET  /member?chat_id=&user_id= single membership snapshot
-    GET  /avatar?user_id=          image bytes (404 when the user has none)
+    GET  /user?user_id=            private-chat profile (bio, username, photos)
+    GET  /avatar?user_id=&s=       image bytes (404 when the user has none)
     GET  /set?name=                sticker / custom-emoji pack
     GET  /img?fid=&uid=            image bytes for a Telegram file id
     POST /send                     text (with entities) | sticker | photo
+                                   sticker accepts a file_id OR media_key (the
+                                   bot's cached MTProto document, uploaded)
     POST /react                    set a reaction on a message
     POST /mod                      promote | demote | kick | ban | unban | mute
     POST /delete                   delete a message
@@ -230,6 +233,39 @@ def r_member(q) -> tuple[int, dict]:
     return 200, member_json(m, 0)
 
 
+def r_user(q) -> tuple[int, dict]:
+    """Profile details behind the "tap a name/avatar" card in the mini app.
+
+    `getChat` with a *user* id returns the private-chat object: exact first /
+    last name, username, bio and whether the account has a photo. The Bot API
+    does not expose last-seen or a join date for privacy reasons, so the card
+    only shows what Telegram actually makes public.
+    """
+    uid = q.get("user_id", [""])[0]
+    if not uid:
+        return 400, {"error": "user_id"}
+    res = cached_json(f"user:{uid}", 180, lambda: api("getChat", chat_id=uid))
+    if not res.get("ok"):
+        return 404, {"error": res.get("description", "getChat failed")}
+    c = res["result"]
+    photos = api("getUserProfilePhotos", user_id=uid, limit=1)
+    total = (photos.get("result") or {}).get("total_count", 0) if photos.get("ok") else 0
+    return 200, {
+        "id": str(c.get("id", uid)),
+        "first_name": c.get("first_name", "") or "",
+        "last_name": c.get("last_name", "") or "",
+        "username": c.get("username", "") or "",
+        "bio": c.get("bio", "") or "",
+        "type": c.get("type", "private") or "private",
+        "photos": total,
+        "has_photo": bool(c.get("photo")),
+        "premium": bool(c.get("is_premium")),
+        "verified": bool(c.get("is_verified")),
+        "private_forwards": bool(c.get("has_private_forwards")),
+        "restricts_voice": bool(c.get("has_restricted_voice_and_video_messages")),
+    }
+
+
 def r_emoji(q) -> tuple[int, dict]:
     """Custom (premium) emoji documents by id — one or many, comma separated."""
     raw = q.get("ids", [""])[0]
@@ -390,6 +426,75 @@ def r_set(q) -> tuple[int, dict]:
     }
 
 
+def api_multipart(method: str, fields: dict, file_field: str,
+                  filename: str, ctype: str, data: bytes) -> dict:
+    """POST one Bot API method as multipart/form-data with a new file upload.
+
+    Only used for re-sending a sticker the bot mirrored over MTProto: a
+    MTProto document id is *not* a Bot API file_id, so the exact cached bytes
+    have to be uploaded again. Telegram re-issues a real file_id in the reply,
+    which is why a sticker saved once can be sent by file_id from then on.
+    """
+    boundary = "----pv" + hashlib.sha1(
+        f"{method}:{filename}:{len(data)}".encode()
+    ).hexdigest()[:24]
+    out = bytearray()
+    for k, v in fields.items():
+        out += (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"\r\n\r\n').encode()
+        out += str(v).encode() + b"\r\n"
+    out += (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+            f"Content-Type: {ctype}\r\n\r\n").encode()
+    out += data + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        API + method,
+        data=bytes(out),
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
+def send_cached_sticker(cid: str, key: str, extra: dict) -> dict:
+    """Upload `cache/tg/<key>.bin` (a sticker mirrored by the bot) to Telegram.
+
+    The bytes are the original WEBP / gzipped TGS / WEBM document, so they
+    already satisfy Telegram's sticker constraints. The extension is sniffed
+    from the magic bytes rather than trusted from the request.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,96}", key or ""):
+        return {"ok": False, "description": "bad media key"}
+    try:
+        data = (CACHE / f"{key}.bin").read_bytes()
+    except Exception:
+        return {"ok": False, "description": "sticker not cached"}
+    if not data:
+        return {"ok": False, "description": "sticker empty"}
+    if data[:2] == b"\x1f\x8b":
+        name, ctype = "sticker.tgs", "application/x-tgsticker"
+    elif data[:4] == b"\x1a\x45\xdf\xa3":
+        name, ctype = "sticker.webm", "video/webm"
+    else:
+        name, ctype = "sticker.webp", "image/webp"
+    fields = {"chat_id": str(cid)}
+    if extra.get("reply_parameters"):
+        fields["reply_parameters"] = json.dumps(extra["reply_parameters"])
+    if extra.get("disable_notification"):
+        fields["disable_notification"] = "true"
+    return api_multipart("sendSticker", fields, "sticker", name, ctype, data)
+
+
 def r_send(body: dict) -> tuple[int, dict]:
     cid = body.get("chat_id")
     if not cid:
@@ -404,9 +509,13 @@ def r_send(body: dict) -> tuple[int, dict]:
     kind = body.get("kind", "text")
     if kind == "sticker":
         fid = body.get("sticker", "")
-        if not fid:
+        media_key = body.get("media_key", "")
+        if fid:
+            res = api("sendSticker", chat_id=cid, sticker=fid, **extra)
+        elif media_key:
+            res = send_cached_sticker(cid, media_key, extra)
+        else:
             return 400, {"error": "sticker"}
-        res = api("sendSticker", chat_id=cid, sticker=fid, **extra)
     elif kind == "photo":
         url = body.get("photo", "")
         if not url:
@@ -556,6 +665,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(code, body)
             if path == "/member":
                 code, body = r_member(q)
+                return self._send(code, body)
+            if path == "/user":
+                code, body = r_user(q)
                 return self._send(code, body)
             if path == "/set":
                 code, body = r_set(q)

@@ -122,6 +122,64 @@ The picker reads real packs through `getStickerSet` (`/api/stickers?set=`) and
 premium emoji through `getCustomEmojiStickers` (`/api/emoji/<id>`), using the
 `thumbnail` the Bot API returns (WebP for all three formats).
 
+## Social & chat interactions
+
+The chat now behaves like Telegram's: tapping a person shows a card, stickers
+can be saved, and every message has a reply / react / copy / forward / delete
+menu. All of it is additive — no existing playback or mirroring path changed.
+
+| Interaction | Where | Behaviour |
+| --- | --- | --- |
+| Tap an avatar / name / member row | chat bubble, member list, `•••` menu | `GET /api/user` profile card |
+| Long-press a bubble, or tap a reaction chip | chat | message action sheet |
+| Swipe a bubble right | chat | reply (same bar as tap-to-reply) |
+| Tap a sticker or its small `+` | chat | sticker sheet → **Add to Stickers** |
+| Saved tab in the picker | sticker panel | per-viewer saved stickers, tap to resend, long-press to remove |
+| Quick actions on the card | profile sheet | Message privately / Mention / Open in Telegram |
+
+The action sheet has a reaction bar (`❤️ 👍 🔥 🥰 😂 😮 😢 🎉`) and a grid of
+Reply, Copy text, Forward, Add to Stickers, React, View profile and Delete.
+Delete is only offered for your own messages or when the viewer is an admin,
+uses `WebApp.showPopup` for confirmation when available, and removes the row
+from the persisted mirror so the next SSE frame cannot paint it back.
+
+**Gesture arbitration.** Tap-to-reply fires after 350 ms, double-tap-to-❤️
+inside 340 ms, long-press after 470 ms and swipe after 12 px of horizontal
+travel (reply at 54 px). A long-press or a swipe sets `suppressUntil` so the
+`click` that follows it cannot also fire the plain tap action. Vertical moves
+are handed back to the browser (`touch-action: pan-y`); native image dragging
+is disabled on chat media because an HTML5 drag fires `pointercancel` and used
+to silently kill the swipe on sticker and photo bubbles. Avatars, names and
+quoted replies stay ordinary tap targets and are excluded from the gesture
+handler.
+
+**New HTTP endpoints** (all under the existing `/api/*` token check):
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/user?id=` | profile card: roster role/tags → `getChat` public fields (name, username, bio, premium, verified) → local message count / last stamp / in-voice flag |
+| `GET /api/avatar/<uid>?s=32..320` | profile photo at a requested size (default 96) |
+| `GET /api/stickers/saved?me=` | the viewer's saved stickers |
+| `POST /api/stickers/saved` | `{me, action: add\|remove\|clear, sticker\|id}` — per-viewer `cache/stickers-<me>.json`, deduped, capped at 120 |
+| `POST /api/chat/delete` | `{mid}` — `deleteMessage` + drop from the mirrored queue |
+| `POST /api/chat/send` | now also accepts `mediaKey` for stickers |
+
+The Bot API sidecar (`tools/tgapi.py`) gained `GET /user` (`getChat` for a
+private-chat object plus `getUserProfilePhotos`) and multipart `sendSticker`.
+
+**Why `mediaKey` exists.** A sticker mirrored over MTProto carries a document
+id, not a Bot API `file_id`; the bot caches its bytes at `cache/tg/<key>.bin`
+and the bubble loads them from `/api/tgmedia/<key>`. `sendSticker` cannot accept
+that document id, so a saved mirrored sticker is re-sent by uploading the exact
+cached bytes with `multipart/form-data` (`send_cached_sticker` sniffs
+`.webp` / `.tgs` / `.webm` from the magic bytes). Telegram issues a real
+`file_id` in the reply, so the same sticker works from then on. The frontend
+keeps both `file_id` and `mediaKey` in each saved record, which is why pack
+stickers and mirrored chat stickers are equally resendable.
+
+Forward sends a private copy through `/api/dm/send` — it is never posted to the
+group, matching the "Forward to…" sheet's promise.
+
 ## Share, invite and private chat
 
 Every snapshot's `room` block carries links built from the bot's @username, so

@@ -21,10 +21,12 @@
 //!   GET  /api/state            full snapshot (room, playback, members, chat)
 //!   GET  /api/search?q=        platform search (registry::search_tracks)
 //!   GET  /api/events           server-sent events (state + new messages)
-//!   GET  /api/avatar/<uid>     profile photo (proxied + cached)
+//!   GET  /api/user?id=         profile card for one chat/member id
+//!   GET  /api/avatar/<uid>?s=  profile photo (proxied + cached, 32..320 px)
 //!   GET  /api/tgimg?fid=       sticker / emoji image (proxied + cached)
 //!   GET  /api/tgmedia/<key>    media downloaded over MTProto by the bot
 //!   GET  /api/stickers?set=    sticker or premium-emoji pack
+//!   GET  /api/stickers/saved?me=   per-viewer "Add to Stickers" list
 //!   GET  /api/dm?me=&peer=     private thread (or thread list without peer)
 //!   POST /api/dm/send          { me, peer, text } — never mirrored
 //!   POST /api/toggle           pause / resume
@@ -36,8 +38,10 @@
 //!   POST /api/queue/clear      {}
 //!   POST /api/play             { id } | { query }
 //!   POST /api/skip             {}
-//!   POST /api/chat/send        { text, kind, sticker, entities, replyTo }
+//!   POST /api/chat/send        { text, kind, sticker, mediaKey, entities, replyTo }
 //!   POST /api/chat/react       { mid, emoji }
+//!   POST /api/chat/delete      { mid } — delete a mirrored message
+//!   POST /api/stickers/saved   { me, action: add|remove, sticker|id }
 //!   POST /api/members          { id, action: promote|demote|kick|ban|unban }
 //!   POST /api/session/end      { id, name } — stop, leave, clear, summarise
 //!   POST /api/settings         { autoplay?: bool, ... }
@@ -2213,13 +2217,21 @@ fn serve_image(app: &MiniApp, stream: &mut TcpStream, req: &Request) -> bool {
     }
 
     // /api/avatar/<uid> and /api/tgimg?fid=... — proxied + memory cached.
-    // Avatars are asked for at 96 px: the Telegram original is ~150 KB and a
-    // roster of ten of them is what made the first paint crawl on mobile.
+    // Chat rows ask for 96 px (the Telegram original is ~150 KB and a roster
+    // of ten of them made the first paint crawl); the profile card asks for
+    // 320 px. The size is part of the cache key so the two never collide.
     let (key, upstream) = if let Some(uid) = path.strip_prefix("/api/avatar/") {
         if !valid_key(uid) {
             return false;
         }
-        (format!("av:{uid}:96"), format!("/avatar?user_id={uid}&s=96"))
+        let px = qs(&req.query, "s")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(96)
+            .clamp(32, 320);
+        (
+            format!("av:{uid}:{px}"),
+            format!("/avatar?user_id={uid}&s={px}"),
+        )
     } else if path == "/api/tgimg" {
         let fid = qs(&req.query, "fid").unwrap_or_default();
         if fid.is_empty() || fid.len() > 400 {
@@ -2275,6 +2287,55 @@ fn serve_image(app: &MiniApp, stream: &mut TcpStream, req: &Request) -> bool {
     }
 }
 
+/* ─────────────────── saved stickers (per viewer) ─────────────────── */
+
+/// "Add to Stickers" is personal, not a room setting: one JSON file per
+/// Telegram viewer under `cache/`, so a saved pack follows the account across
+/// restarts and is never broadcast to anyone else. The viewer id comes from
+/// `initDataUnsafe`, so it is sanitised into a filename here as well.
+fn saved_stickers_file(me: &str) -> PathBuf {
+    let mut safe: String = me
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(48)
+        .collect();
+    if safe.is_empty() {
+        safe = "anon".to_string();
+    }
+    PathBuf::from("cache").join(format!("stickers-{safe}.json"))
+}
+
+fn saved_stickers_read(me: &str) -> Vec<Value> {
+    let Ok(raw) = std::fs::read(saved_stickers_file(me)) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<Vec<Value>>(&raw) {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    }
+}
+
+fn saved_stickers_write(me: &str, list: &[Value]) -> bool {
+    let Ok(body) = serde_json::to_vec(list) else {
+        return false;
+    };
+    let _ = std::fs::create_dir_all("cache");
+    let path = saved_stickers_file(me);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+}
+
+/// Merge every key of `src` into `dst`. Profile cards are assembled from three
+/// sources (roster, Bot API `getChat`, local chat stats); without a helper the
+/// same "insert if present" loop would be repeated for each one.
+fn merge_obj(dst: &mut serde_json::Map<String, Value>, src: &Value) {
+    if let Some(o) = src.as_object() {
+        for (k, v) in o {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
     let body: Value = if req.body.is_empty() {
         json!({})
@@ -2295,6 +2356,91 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
         return (200, app.snapshot(true));
     }
 
+    // ── Profile card: tap a name or avatar in the chat / member list. ──
+    // Three sources are merged (roster → Bot API getChat → local chat stats),
+    // and every one of them is optional. A user who only ever posted one
+    // message and never became an admin still gets a useful card: name,
+    // username, role tags, how many messages they sent here and their bio.
+    if req.method == "GET" && req.path == "/api/user" {
+        let id = qs(&req.query, "id").unwrap_or_default();
+        if !valid_key(&id) {
+            return (400, json!({ "error": "id" }));
+        }
+        let mut out = serde_json::Map::new();
+
+        // 1) Room role, custom title, "in voice" and the tag chips.
+        let known = app.member_by_id(&id);
+        if let Some(m) = &known {
+            merge_obj(&mut out, m);
+        } else if let Some(m) = tg_json(&format!(
+            "/member?chat_id={}&user_id={id}",
+            app.active_chat()
+        ))
+        .and_then(|m| roster_row(&m, &host_ids()))
+        {
+            merge_obj(&mut out, &m);
+        }
+
+        // 2) Public Telegram profile. Overrides the roster's (possibly stale)
+        // name/username with the exact values, and adds bio / photo count.
+        if let Some(u) = tg_json(&format!("/user?user_id={id}")) {
+            merge_obj(&mut out, &u);
+            let first = u["first_name"].as_str().unwrap_or("");
+            let last = u["last_name"].as_str().unwrap_or("");
+            let full = format!("{first} {last}").trim().to_string();
+            if !full.is_empty() {
+                out.insert("name".to_string(), json!(full));
+            }
+        }
+
+        // 3) Never let an upstream decide the id or the avatar URL: the mini
+        //    app always loads photos through the cache proxy.
+        out.insert("id".to_string(), json!(id));
+        out.insert("photo".to_string(), json!(format!("/api/avatar/{id}")));
+        out.insert(
+            "photo_big".to_string(),
+            json!(format!("/api/avatar/{id}?s=320")),
+        );
+
+        // 4) Local facts Telegram cannot expose (privacy): how much this
+        //    person talked in the mirrored room chat and their last stamp.
+        let q = app.messages.lock().unwrap_or_else(|e| e.into_inner());
+        let posts: usize = q
+            .iter()
+            .filter(|m| m["from"].as_str() == Some(id.as_str()))
+            .count();
+        let last = q
+            .iter()
+            .rev()
+            .find(|m| m["from"].as_str() == Some(id.as_str()))
+            .and_then(|m| m["ts"].as_str())
+            .unwrap_or("")
+            .to_string();
+        drop(q);
+        out.insert("messages".to_string(), json!(posts));
+        out.insert("last_seen".to_string(), json!(last));
+        out.insert(
+            "in_voice".to_string(),
+            json!(known.as_ref().map(|m| m["vc"] == true).unwrap_or(false)),
+        );
+        if out
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
+            out.insert("name".to_string(), json!("member"));
+        }
+        if !out.contains_key("tags") {
+            out.insert("tags".to_string(), json!([{"k":"member","label":"MEMBER"}]));
+        }
+        if !out.contains_key("role") {
+            out.insert("role".to_string(), json!("member"));
+            out.insert("status".to_string(), json!("member"));
+        }
+        return (200, Value::Object(out));
+    }
+
     if req.method == "GET" && req.path == "/api/stickers" {
         let set = qs(&req.query, "set").unwrap_or_default();
         if !valid_key(&set) {
@@ -2304,6 +2450,16 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
             Some(v) => (200, v),
             None => (502, json!({ "error": "sticker set unavailable" })),
         };
+    }
+
+    // "Add to Stickers": the viewer's personal saved list. A GET is cheap and
+    // never touches Telegram, so the Saved tab opens instantly even offline.
+    if req.method == "GET" && req.path == "/api/stickers/saved" {
+        let me = qs(&req.query, "me").unwrap_or_default();
+        if me.is_empty() || me.len() > 64 {
+            return (400, json!({ "error": "me" }));
+        }
+        return (200, json!({ "stickers": saved_stickers_read(&me) }));
     }
 
     if req.method == "GET" && req.path == "/api/search" {
@@ -2536,6 +2692,15 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
             });
             if kind == "sticker" {
                 req_body["sticker"] = json!(sticker);
+                // A sticker mirrored from the Telegram group has no Bot API
+                // file_id, only the bytes the bot cached under a media key.
+                // The tgapi bridge uploads those bytes with multipart
+                // sendSticker, so "Saved" stickers work for chat stickers too,
+                // not just the ones that came out of a public pack.
+                let media_key = body["mediaKey"].as_str().unwrap_or("");
+                if !media_key.is_empty() && media_key.len() <= 96 {
+                    req_body["media_key"] = json!(media_key);
+                }
             }
             // Preview/seed path: store the message for this instance only.
             // Handy for screenshots and demos without posting to the group.
@@ -2624,6 +2789,79 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
                 }
                 _ => return (502, json!({ "error": "reaction failed" })),
             }
+        }
+        "/api/chat/delete" => {
+            let mid = body["mid"].as_i64().unwrap_or(0);
+            if mid == 0 {
+                return (400, json!({ "error": "mid" }));
+            }
+            let req_body = json!({
+                "chat_id": app.active_chat().to_string(),
+                "message_id": mid,
+            });
+            match tg_post("/delete", &req_body) {
+                Some((code, res)) if code == 200 => {
+                    // Drop it from the mirrored queue too, otherwise the next
+                    // SSE frame would paint the deleted bubble straight back.
+                    let mut q = app.messages.lock().unwrap_or_else(|e| e.into_inner());
+                    let kept: VecDeque<Value> = q
+                        .iter()
+                        .filter(|m| m["mid"].as_i64() != Some(mid))
+                        .cloned()
+                        .collect();
+                    *q = kept;
+                    drop(q);
+                    app.save_chat();
+                    return (200, json!({ "ok": true }));
+                }
+                Some((_, res)) => {
+                    return (
+                        502,
+                        json!({ "error": res["error"].as_str().unwrap_or("delete failed") }),
+                    )
+                }
+                None => return (503, json!({ "error": "telegram bridge offline" })),
+            }
+        }
+        "/api/stickers/saved" => {
+            let me = body["me"].as_str().unwrap_or("").to_string();
+            if me.is_empty() || me.len() > 64 {
+                return (400, json!({ "error": "me" }));
+            }
+            let action = body["action"].as_str().unwrap_or("add");
+            let mut list = saved_stickers_read(&me);
+            match action {
+                "remove" => {
+                    let id = body["id"].as_str().unwrap_or("").to_string();
+                    list.retain(|s| s["id"].as_str() != Some(id.as_str()));
+                }
+                "clear" => list.clear(),
+                _ => {
+                    let mut s = body["sticker"].clone();
+                    if !s.is_object() {
+                        return (400, json!({ "error": "sticker" }));
+                    }
+                    let sid = s["id"].as_str().unwrap_or("").to_string();
+                    let sid = if sid.is_empty() {
+                        format!("sv{}", now_ms())
+                    } else {
+                        sid
+                    };
+                    if let Some(o) = s.as_object_mut() {
+                        o.insert("id".to_string(), json!(sid.clone()));
+                        o.insert("saved_at".to_string(), json!(now_secs()));
+                    }
+                    // Re-saving moves a sticker to the top instead of adding a
+                    // duplicate; 120 is plenty for a "recently saved" strip.
+                    list.retain(|x| x["id"].as_str() != Some(sid.as_str()));
+                    list.insert(0, s);
+                    list.truncate(120);
+                }
+            }
+            if !saved_stickers_write(&me, &list) {
+                return (500, json!({ "error": "could not save stickers" }));
+            }
+            return (200, json!({ "ok": true, "stickers": list }));
         }
         "/api/members" => {
             let id = body["id"].as_str().unwrap_or_default().to_string();
