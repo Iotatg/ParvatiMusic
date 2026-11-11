@@ -150,11 +150,6 @@ impl IotaApi {
         !self.bases.is_empty() && !self.key.is_empty()
     }
 
-    /// Primary backend (kept for callers that only need one URL).
-    fn url(&self) -> &str {
-        self.bases.first().map(|s| s.as_str()).unwrap_or("")
-    }
-
     /// Bases to try right now: healthy ones first, dead ones only when every
     /// base is cooling down (a stale breaker must not disable playback).
     fn live_bases(&self) -> Vec<String> {
