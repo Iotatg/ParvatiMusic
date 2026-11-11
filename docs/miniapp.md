@@ -431,6 +431,18 @@ The mini app talks to one loopback service, both started by `tools/run.sh`:
 comes back it re-points the chat menu button automatically. Use systemd in
 production.
 
+**`TGAPI_KEY` must match on both sides.** The Rust hub loads `.env` and sends
+its `TGAPI_KEY` as the `x-tgapi-key` header on every request to the bridge;
+`tools/tgapi.py` resolves `TGAPI_KEY` the same way — an exported environment
+variable wins, otherwise it falls back to `.env`, otherwise the default
+`local-dev-key`. `TOKEN`, `TGAPI_KEY` and `TGAPI_PORT` all use this shared
+resolver, so the two processes cannot disagree even when the supervisor (or a
+systemd unit) does not export `.env`. This matters most when you replace the
+default key with your own secret: changing it only in `.env` is enough — do
+**not** export a different value into just one of the two processes, or every
+bridge call (profile cards, saved stickers, message actions) will fail with
+`401`. Verify with `curl -s -o /dev/null -w '%{http_code}' -H "x-tgapi-key: $TGAPI_KEY" http://127.0.0.1:8098/health` → `200`.
+
 ## Iota catalogue (upstream API)
 
 The bot can also read a full [Iota-api](https://github.com/Iotatg/Iota-api)

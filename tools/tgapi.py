@@ -54,23 +54,33 @@ ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "cache" / "tg"
 CACHE.mkdir(parents=True, exist_ok=True)
 
-PORT = int(os.environ.get("TGAPI_PORT", "8098"))
-KEY = os.environ.get("TGAPI_KEY", "local-dev-key")
+def _env(key: str, default: str = "") -> str:
+    """Resolve a setting the same way the Rust hub does: env var wins, else .env.
+
+    bot/src/webapp.rs loads .env with "existing env wins" and sends TGAPI_KEY
+    as the `x-tgapi-key` header on *every* request to this bridge. If this side
+    only read os.environ (falling back to a hard-coded default), a custom key
+    set in .env would be ignored here and every authenticated call would fail
+    with 401 while the hub kept sending that custom value. TOKEN always used
+    this fallback; TGAPI_KEY / TGAPI_PORT now share it, so the two processes
+    cannot disagree no matter how the bridge is launched (supervise.sh,
+    systemd, or by hand) — even when the supervisor doesn't export .env.
+    """
+    val = os.environ.get(key, "").strip()
+    if val:
+        return val
+    dotenv = ROOT / ".env"
+    if dotenv.exists():
+        for line in dotenv.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return default
 
 
-def _read_token() -> str:
-    tok = os.environ.get("TOKEN", "").strip()
-    if tok:
-        return tok
-    env = ROOT / ".env"
-    if env.exists():
-        for line in env.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("TOKEN="):
-                return line.split("=", 1)[1].strip()
-    return ""
-
-
-TOKEN = _read_token()
+TOKEN = _env("TOKEN")
+KEY = _env("TGAPI_KEY", "local-dev-key")
+PORT = int(_env("TGAPI_PORT", "8098"))
 API = f"https://api.telegram.org/bot{TOKEN}/"
 FILE = f"https://api.telegram.org/file/bot{TOKEN}/"
 
