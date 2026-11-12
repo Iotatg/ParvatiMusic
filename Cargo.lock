@@ -1249,11 +1249,13 @@ name = "parvati_bot"
 version = "0.1.0"
 dependencies = [
  "ferogram",
+ "hmac",
  "libc",
  "parvati-ntg",
  "parvati_mtproto",
  "reqwest",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
 ]
 

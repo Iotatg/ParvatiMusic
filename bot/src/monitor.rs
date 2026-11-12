@@ -48,7 +48,9 @@ enum Outcome {
     Deferred,
     /// status already emitted; caller drops the room.
     Finished,
-    Failed,
+    /// Nothing playable right now, but the call stays up (download failure /
+    /// engine refusal). The room is kept, not dropped.
+    Stalled,
     Gone,
 }
 
@@ -72,7 +74,7 @@ pub fn advance_room(
     let outcome = advance_locked(&mut r, chat_id, assists, bot, loc, sink);
     r.unlock_advance();
     drop(r);
-    if matches!(outcome, Outcome::Finished | Outcome::Failed) {
+    if matches!(outcome, Outcome::Finished) {
         rooms.drop_room(chat_id);
     }
     true
@@ -132,61 +134,120 @@ fn advance_locked(
         }
     }
 
-    let Some(mut next) = next else {
+    let Some(first_next) = next else {
         parv_info!("monitor", "advance chat {chat_id}: queue finished");
         set_status(bot, r, &f(loc, chat_id, "stream_queue_finished"));
         return Outcome::Finished;
     };
-    parv_info!("monitor", "advance chat {chat_id}: next track \"{}\"", next.title);
-    set_status(bot, r, &f(loc, chat_id, "stream_downloading_next"));
+    let mut next: Option<Track> = Some(first_next);
 
-    let mut dl_err = String::new();
-    let mut path = sink.download_track(&next, &mut dl_err);
-    if path.is_empty() && next.is_autoplay {
-        // Re-pick pass for autoplay on download failure (Go retry tiers):
-        // 8 candidates this time, tried in relevance order.
-        if let Some(last) = r.track.clone() {
-            let history = r.played_history();
-            for c in sink.autoplay_tracks(&last, 8, &history) {
-                if c.id.is_empty() && c.url.is_empty() {
-                    continue;
-                }
-                dl_err.clear();
-                path = sink.download_track(&c, &mut dl_err);
-                if !path.is_empty() {
-                    let mut c = c;
-                    c.mark_autoplay(&f(loc, chat_id, "autoplay_requester"), &r.engine_token);
-                    next = c;
-                    break;
+    // A failed download must NOT end the voice chat. The old `Failed` outcome
+    // dropped the room, so one 502 from the catalogue closed the call and
+    // looked exactly like a crash. Try the next queued track (3 attempts),
+    // then stay in the call idle instead of hanging up.
+    let mut last_err = String::new();
+    let mut tries = 0u32;
+    while let Some(candidate) = next.take() {
+        tries += 1;
+        let mut track = candidate;
+        parv_info!(
+            "monitor",
+            "advance chat {chat_id}: next track \"{}\" (attempt {tries})",
+            track.title
+        );
+        set_status(bot, r, &f(loc, chat_id, "stream_downloading_next"));
+
+        let mut dl_err = String::new();
+        let mut path = sink.download_track(&track, &mut dl_err);
+        if path.is_empty() && track.is_autoplay {
+            // Re-pick pass for autoplay on download failure (Go retry tiers):
+            // 8 candidates this time, tried in relevance order.
+            if let Some(last) = r.track.clone() {
+                let history = r.played_history();
+                for c in sink.autoplay_tracks(&last, 8, &history) {
+                    if c.id.is_empty() && c.url.is_empty() {
+                        continue;
+                    }
+                    dl_err.clear();
+                    path = sink.download_track(&c, &mut dl_err);
+                    if !path.is_empty() {
+                        let mut c = c;
+                        c.mark_autoplay(&f(loc, chat_id, "autoplay_requester"), &r.engine_token);
+                        track = c;
+                        break;
+                    }
                 }
             }
         }
-    }
-    if path.is_empty() {
-        let failed = if dl_err.is_empty() { "unknown".to_string() } else { dl_err.clone() };
-        parv_warn!("monitor", "advance chat {chat_id}: download failed: {failed}");
-        let err = if dl_err.is_empty() { "download".to_string() } else { dl_err };
-        set_status(bot, r, &f_args(loc, chat_id, "stream_download_fail", &[("error", err.as_str())]));
-        return Outcome::Failed;
-    }
-    if r.destroyed() {
-        return Outcome::Gone;
-    }
-    if !matches!(r.play(next.clone(), path.clone(), true), PlayAction::Started) {
-        set_status(bot, r, &f(loc, chat_id, "stream_play_fail"));
-        return Outcome::Failed;
+
+        if path.is_empty() {
+            last_err = if dl_err.is_empty() {
+                "download".to_string()
+            } else {
+                dl_err.clone()
+            };
+            parv_warn!(
+                "monitor",
+                "advance chat {chat_id}: attempt {tries} failed: {last_err}"
+            );
+            if tries >= 3 {
+                break;
+            }
+            next = r.next_track();
+            if next.is_none() && r.autoplay {
+                if let Some(last) = r.track.clone() {
+                    let history = r.played_history();
+                    let pool: Vec<Track> = sink
+                        .autoplay_tracks(&last, 5, &history)
+                        .into_iter()
+                        .filter(|c| !(c.id.is_empty() && c.url.is_empty()))
+                        .collect();
+                    if let Some(mut pick) = golden_zone_pick(&pool) {
+                        pick.mark_autoplay(
+                            &f(loc, chat_id, "autoplay_requester"),
+                            &r.engine_token,
+                        );
+                        next = Some(pick);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if r.destroyed() {
+            return Outcome::Gone;
+        }
+        if !matches!(r.play(track.clone(), path.clone(), true), PlayAction::Started) {
+            set_status(bot, r, &f(loc, chat_id, "stream_play_fail"));
+            return Outcome::Stalled;
+        }
+
+        // Context glue (RoomState::play called play_native directly).
+        let speed = r.speed();
+        let video = track.video;
+        if play_native_at(chat_id, r, assists, &path, 0, speed, video).is_err() {
+            set_status(bot, r, &f(loc, chat_id, "stream_play_fail"));
+            return Outcome::Stalled;
+        }
+        r.playing = true;
+        send_now_playing(bot, chat_id, r, &track, loc);
+        return Outcome::Started;
     }
 
- // Context glue (RoomState::play called play_native directly).
-    let speed = r.speed();
-    let video = next.video;
-    if play_native_at(chat_id, r, assists, &path, 0, speed, video).is_err() {
-        set_status(bot, r, &f(loc, chat_id, "stream_play_fail"));
-        return Outcome::Failed;
-    }
-    r.playing = true;
-    send_now_playing(bot, chat_id, r, &next, loc);
-    Outcome::Started
+    let err = if last_err.is_empty() {
+        "download".to_string()
+    } else {
+        last_err
+    };
+    set_status(
+        bot,
+        r,
+        &f_args(loc, chat_id, "stream_download_fail", &[("error", err.as_str())]),
+    );
+    // Stay in the call: the bot remains joined, the app shows the error and a
+    // new tap (or /play) starts the next song.
+    r.playing = false;
+    Outcome::Stalled
 }
 
 /// play_native: hand the file to the chat's assistant voice engine.
@@ -204,7 +265,7 @@ fn play_native(
 
 pub(crate) fn play_native_at(
     chat_id: i64,
-    _r: &mut RoomState,
+    r: &mut RoomState,
     assists: &AssistantManager,
     path: &str,
     pos: i64,
@@ -218,6 +279,14 @@ pub(crate) fn play_native_at(
                 parv_error!("monitor", "advance chat {chat_id}: play failed: {e}");
                 Err(e)
             } else {
+                // The playhead must start when the engine *accepted* the
+                // stream, not when `RoomState::play` reserved the slot: the
+                // connect/handshake can take seconds, and a clock started too
+                // early made the 4 s watchdog believe the song had ended and
+                // cut it off before the last verse.
+                r.position = pos;
+                r.updated_at = now_secs() as i64;
+                r.playing = true;
                 Ok(())
             }
         }
@@ -387,28 +456,97 @@ fn play_markup(loc: &Locales, chat_id: i64, view: &crate::buttons::RoomView, que
     crate::buttons::play_markup(loc, &lang, view, queued)
 }
 
+/// One native stream-end event: chat, stream mode and the device whose source
+/// ended. A video track owns *two* ffmpeg pipes (microphone + camera); only the
+/// microphone ending means the song is over.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamEnd {
+    pub chat: i64,
+    pub mode: i32,
+    pub device: i32,
+}
+
+/// A real "song finished" arrives within this many seconds of the track
+/// duration. Anything earlier is a closed/dropped source (EPIPE), not the end.
+const END_TOLERANCE_SECS: i64 = 8;
+/// A premature EOF is healed by restarting the source at the current position.
+/// After this many heals on the same track, stop fighting and advance.
+const MAX_HEALS: u32 = 3;
+/// The heal budget resets when the track changes or after this long.
+const HEAL_WINDOW_SECS: u64 = 180;
+/// Two microphone ends for the same chat inside this window are one event.
+const END_DEBOUNCE_SECS: u64 = 2;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// chat → (first-heal-at, heals-used, track-id).
+fn heals() -> &'static Mutex<HashMap<i64, (u64, u32, String)>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<i64, (u64, u32, String)>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// chat → last microphone-end timestamp (debounce).
+fn last_end() -> &'static Mutex<HashMap<i64, u64>> {
+    static L: std::sync::OnceLock<Mutex<HashMap<i64, u64>>> = std::sync::OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Wire every assistant's stream-end callback to a shared channel; the caller
 /// (main) drains it and advances the affected room off the ntg thread.
-pub fn wire_stream_end(assists: &AssistantManager) -> std::sync::mpsc::Receiver<i64> {
+pub fn wire_stream_end(assists: &AssistantManager) -> std::sync::mpsc::Receiver<StreamEnd> {
     let (tx, rx) = std::sync::mpsc::channel();
     assists.for_each(|a| {
         let mut ctx = a.ntg();
+        // Never block the native audio thread: the context forwards the event
+        // to the monitor thread, which decides what it means.
         ctx.on_stream_end(tx.clone());
     });
     parv_info!("monitor", "stream-end handlers wired for assistants");
     rx
 }
 
-/// Drive stream-end events into advance_room on their own threads
+/// Drive stream-end events into the room, filtering out the ones that must not
+/// end playback (camera/screen EOF, duplicate reports) and healing a premature
+/// audio EOF instead of dropping the call.
 pub fn run_stream_end(
-    rx: std::sync::mpsc::Receiver<i64>,
+    rx: std::sync::mpsc::Receiver<StreamEnd>,
     rooms: Rooms,
     assists: Arc<AssistantManager>,
     bot: Arc<Mutex<Box<dyn Bot>>>,
     loc: Arc<Locales>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for chat_id in rx {
+        for ev in rx {
+            // A video track's camera pipe ends independently of the song. Its
+            // EOF (or a broken pipe when the encoder closes) used to advance
+            // the whole room and drop the voice chat mid-song.
+            if ev.device == parvati_ntg::DEVICE_CAMERA || ev.device == parvati_ntg::DEVICE_SCREEN {
+                parv_info!(
+                    "monitor",
+                    "stream end chat {}: video source closed (device {}), ignored",
+                    ev.chat,
+                    ev.device
+                );
+                continue;
+            }
+            if ev.mode != parvati_ntg::STREAM_CAPTURE {
+                continue;
+            }
+            {
+                let now = now_secs();
+                let mut last = last_end().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(prev) = last.get(&ev.chat) {
+                    if now.saturating_sub(*prev) < END_DEBOUNCE_SECS {
+                        continue;
+                    }
+                }
+                last.insert(ev.chat, now);
+            }
             let bot = bot.clone();
             let rooms = rooms.clone();
             let assists = assists.clone();
@@ -416,8 +554,108 @@ pub fn run_stream_end(
             thread::spawn(move || {
                 let mut b = bot.lock().unwrap_or_else(|e| e.into_inner());
                 let bb: &mut dyn Bot = b.as_mut();
-                advance_room(chat_id, &rooms, &assists, bb, &loc, &RealSink);
+                handle_stream_end(ev, &rooms, &assists, bb, &loc);
             });
         }
     })
+}
+
+/// Decide what a microphone stream-end means for the room.
+fn handle_stream_end(
+    ev: StreamEnd,
+    rooms: &Rooms,
+    assists: &AssistantManager,
+    bot: &mut dyn Bot,
+    loc: &Locales,
+) {
+    if crate::webapp::play_pending() {
+        return;
+    }
+    let Some(room) = rooms.room_for(ev.chat) else { return };
+    let (premature, pos, dur, track_id) = {
+        let mut r = room.lock().unwrap_or_else(|e| e.into_inner());
+        if r.destroyed() || !r.active() || r.paused {
+            return;
+        }
+        // Bring the playhead up to date before comparing it to the duration;
+        // the 4 s tick may be stale by a few seconds.
+        r.tick_position();
+        let dur = r.track.as_ref().map(|t| t.duration).unwrap_or(0);
+        let pos = r.position;
+        let id = r.track.as_ref().map(|t| t.id.clone()).unwrap_or_default();
+        (dur > 0 && pos + END_TOLERANCE_SECS < dur, pos, dur, id)
+    };
+
+    if premature {
+        parv_warn!(
+            "monitor",
+            "stream end chat {}: premature EOF at {pos}s/{dur}s — recovering, not advancing",
+            ev.chat
+        );
+        if heal_stream(ev.chat, &room, assists, pos, &track_id) {
+            return;
+        }
+        parv_warn!(
+            "monitor",
+            "stream end chat {}: recovery exhausted, advancing",
+            ev.chat
+        );
+    }
+
+    advance_room(ev.chat, rooms, assists, bot, loc, &RealSink);
+}
+
+/// Restart the source at the current position. Returns true when the stream is
+/// live again (or the room is gone), false when the heal budget is spent.
+fn heal_stream(
+    chat: i64,
+    room: &Arc<Mutex<RoomState>>,
+    assists: &AssistantManager,
+    pos: i64,
+    track_id: &str,
+) -> bool {
+    let now = now_secs();
+    let attempt = {
+        let mut h = heals().lock().unwrap_or_else(|e| e.into_inner());
+        let e = h.entry(chat).or_insert((0, 0, String::new()));
+        if e.2 != track_id || now.saturating_sub(e.0) > HEAL_WINDOW_SECS {
+            *e = (now, 0, track_id.to_string());
+        }
+        if e.1 >= MAX_HEALS {
+            return false;
+        }
+        e.1 += 1;
+        e.1
+    };
+
+    let (path, speed, video) = {
+        let r = room.lock().unwrap_or_else(|e| e.into_inner());
+        if r.destroyed() || !r.active() {
+            return true;
+        }
+        (
+            r.file_path.clone(),
+            r.speed(),
+            r.track.as_ref().map(|t| t.video).unwrap_or(false),
+        )
+    };
+    if path.is_empty() {
+        return false;
+    }
+
+    parv_warn!(
+        "monitor",
+        "stream end chat {chat}: restarting at {pos}s (heal {attempt}/{MAX_HEALS})"
+    );
+    let mut r = room.lock().unwrap_or_else(|e| e.into_inner());
+    match play_native_at(chat, &mut r, assists, &path, pos, speed, video) {
+        Ok(()) => {
+            r.playing = true;
+            true
+        }
+        Err(e) => {
+            parv_error!("monitor", "stream end chat {chat}: heal failed: {e}");
+            false
+        }
+    }
 }

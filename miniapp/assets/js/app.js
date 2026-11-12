@@ -21,6 +21,19 @@
       tg.disableVerticalSwipes?.();
     } catch {}
   }
+  /* Telegram signs `initData` with the bot token; the server verifies that
+     HMAC, so this is the only thing that proves who is opening the app. */
+  const INIT_DATA = tg?.initData || '';
+  if (INIT_DATA) {
+    // <img>, <video> and EventSource cannot set request headers, so the same
+    // credential is stored in a cookie they send automatically.
+    document.cookie = 'parvati_auth=' + encodeURIComponent(INIT_DATA) + '; path=/; SameSite=Lax; max-age=86400';
+  }
+  const withAuth = (p) => {
+    let u = withToken(p);
+    if (INIT_DATA) u += (u.includes('?') ? '&' : '?') + 'init=' + encodeURIComponent(INIT_DATA);
+    return u;
+  };
   const haptic = (type = 'light') => {
     if (state.settings && state.settings.haptics === false) return;
     try {
@@ -119,14 +132,16 @@
   async function api(path, body) {
     const headers = { 'content-type': 'application/json' };
     if (TOKEN) headers['x-miniapp-token'] = TOKEN;
-    const res = await fetch(withToken(path), body === undefined ? { headers } : {
+    // Header values must stay ASCII: initData contains '&' and '='.
+    if (INIT_DATA) headers['x-telegram-init-data'] = encodeURIComponent(INIT_DATA);
+    const res = await fetch(withAuth(path), body === undefined ? { headers } : {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
     });
     if (!res.ok) {
       let msg = `${res.status}`;
-      try { const j = await res.json(); if (j.error) msg = j.error; } catch {}
+      try { const j = await res.json(); if (j.error) msg = j.error; if (j.hint) msg = j.hint; } catch {}
       throw new Error(msg);
     }
     return res.json();
@@ -166,8 +181,15 @@
       online = true;
       if (!viewer) viewer = { id: String(state.me.id || ''), name: state.me.name || 'you', username: state.me.username || '', photo: state.me.photo || '' };
       connectEvents();
-    } catch {
+    } catch (e) {
       online = false;
+      // The server refused the credential: never fall back to a demo room,
+      // that is exactly the "anyone with the link can use it" hole.
+      const msg = String((e && e.message) || '');
+      if (msg === 'unauthorized' || /Telegram|member|allowed/i.test(msg)) {
+        showGate(msg);
+        return;
+      }
       if (!viewer) viewer = { id: '42', name: 'you', username: 'you', photo: '' };
       setInterval(() => { if (!state.playback.paused && state.playback.track) localPos += 1; }, 1000);
     }
@@ -175,9 +197,24 @@
     renderAll();
   }
 
+  /** Full-screen block shown when Telegram verification fails. */
+  function showGate(reason) {
+    if (document.querySelector('.auth-gate')) return;
+    const el = document.createElement('div');
+    el.className = 'auth-gate';
+    el.innerHTML = `
+      <div class="auth-card">
+        <div class="auth-icon">🔒</div>
+        <h2>Verification required</h2>
+        <p>${esc(reason || 'Open this app from Telegram.')}</p>
+        <p class="auth-sub">This room only opens for Telegram accounts that belong to it. A shared link alone is not enough.</p>
+      </div>`;
+    document.body.appendChild(el);
+  }
+
   function connectEvents() {
     try {
-      const es = new EventSource(withToken('/api/events'));
+      const es = new EventSource(withAuth('/api/events'));
       es.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);

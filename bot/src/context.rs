@@ -183,7 +183,7 @@ pub struct Context {
     binding: Box<dyn VoiceBinding>,
     mt: Option<MtClient>,
     calls: HashMap<i64, Mount>,
-    stream_tx: Option<Sender<i64>>,
+    stream_tx: Option<Sender<crate::monitor::StreamEnd>>,
 }
 
 impl Context {
@@ -393,12 +393,14 @@ impl Context {
         ok
     }
 
-    /// Forward stream-end events to `tx` (the monitor's advance loop).
-    pub fn on_stream_end(&mut self, tx: Sender<i64>) {
+    /// Forward stream-end events to `tx` (the monitor's advance loop), keeping
+    /// the stream mode and device so a camera EOF cannot end the song.
+    pub fn on_stream_end(&mut self, tx: Sender<crate::monitor::StreamEnd>) {
         let sink = tx.clone();
-        self.binding.on_stream_end(std::sync::Arc::new(move |chat| {
-            let _ = sink.send(chat);
-        }));
+        self.binding
+            .on_stream_end(std::sync::Arc::new(move |chat, mode, device| {
+                let _ = sink.send(crate::monitor::StreamEnd { chat, mode, device });
+            }));
         self.stream_tx = Some(tx);
     }
 
@@ -422,7 +424,11 @@ impl Context {
 
     pub fn fire_stream_end(&mut self, chat_id: i64) {
         if let Some(tx) = &self.stream_tx {
-            let _ = tx.send(chat_id);
+            let _ = tx.send(crate::monitor::StreamEnd {
+                chat: chat_id,
+                mode: parvati_ntg::STREAM_CAPTURE,
+                device: parvati_ntg::DEVICE_MICROPHONE,
+            });
         }
     }
 }

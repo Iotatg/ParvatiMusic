@@ -50,11 +50,44 @@ MINIAPP_ROOM_TITLE=chingu gang
 MINIAPP_ME_NAME=Iota
 MINIAPP_ME_USERNAME=iota
 MINIAPP_DIR=miniapp
-# optional shared secret; when set, /api/* needs ?token=… or X-MiniApp-Token
+# optional shared secret for trusted integrations (control plane only)
 MINIAPP_TOKEN=
+# require a real Telegram identity (default on). The server verifies the
+# WebApp initData HMAC with TOKEN; a bare URL is refused with 401.
+MINIAPP_REQUIRE_MEMBER=1
+# optional allow-list, comma separated Telegram user ids
+MINIAPP_ALLOWED_IDS=
+# how long a signed initData is accepted, seconds
+MINIAPP_AUTH_MAX_AGE=86400
+# dev only: serve /api/* without Telegram (never enable in production)
+MINIAPP_ALLOW_OPEN=0
 ```
 
 `MINIAPP_PORT` must differ from `PORT` (the health server binds that one).
+
+## Authentication (who is allowed in)
+
+The mini app is a Telegram Web App, so every request carries `initData` —
+signed by Telegram with this bot's token. The server verifies it on **every**
+`/api/*` call:
+
+1. `secret = HMAC_SHA256(key = "WebAppData", msg = bot_token)`
+2. `hash   = HMAC_SHA256(key = secret, msg = sorted "key=value" lines)`
+3. compare in constant time, then require a fresh `auth_date`
+   (`MINIAPP_AUTH_MAX_AGE`, default 24 h).
+
+The verified `user.id` becomes the request identity: the `me` field the client
+sends is ignored, so nobody can impersonate another member. With
+`MINIAPP_REQUIRE_MEMBER=1` the user must also belong to the mirrored chat
+(roster first, then one `getChatMember` call cached for 5 min).
+
+A plain browser that opens the tunnel URL has no `initData` and gets
+`401 {"error":"unauthorized","reason":"none","hint":"Open this app from Telegram."}`.
+The page shows a verification screen instead of the room.
+
+The credential travels three ways so header-less requests work too: the
+`X-Telegram-Init-Data` header (fetch), `?init=` (EventSource, `<video>`), and
+the `parvati_auth` cookie the page sets once (covers `<img>`, `<video>`, SSE).
 
 ## Identity: roster, avatars, roles
 
@@ -372,22 +405,21 @@ sync with what happens in Telegram.
 
 ## Security
 
-* The API controls a live voice chat — **do not expose it without a token.**
-  Set `MINIAPP_TOKEN` and open the app as
-  `https://host/?token=…` (Telegram menu-button URL), or keep the port on a
-  private network behind the reverse proxy.
-* For a hardened setup, validate Telegram's `initData` (`hash` = HMAC-SHA256 of
-  the data-check-string with `HMAC_SHA256(bot_token, "WebAppData")`) and map
-  `user.id` to a room admin before allowing mutating calls. The bridge
-  deliberately keeps auth pluggable instead of shipping a half-check.
-* Static assets are public; only `/api/*` is gated.
-* Private chats are stored under `cache/dm-<chat>.json` and every read is
-  filtered by the caller's Telegram user id (`?me=`), so the app only ever
-  renders the two participants' thread. Because `me` comes from the client,
-  a shared deployment should also enable `MINIAPP_TOKEN` / `initData`
-  validation — otherwise anyone who can reach `/api/dm` and knows a numeric id
-  could ask for that thread. On a private LAN or behind the tunnel with a
-  token this is not reachable.
+* The API controls a live voice chat. Every `/api/*` request is authenticated
+  with the Telegram WebApp `initData` signature (see **Authentication** above);
+  the verified `user.id` replaces the client-supplied `me`, so a caller cannot
+  act as someone else.
+* `MINIAPP_REQUIRE_MEMBER=1` (default) additionally requires the user to belong
+  to the mirrored chat. Set `MINIAPP_ALLOWED_IDS` for an explicit allow-list.
+* `MINIAPP_TOKEN` remains for trusted machine integrations (scripts, the bot's
+  own calls). It grants the control plane, never a user identity.
+* `MINIAPP_ALLOW_OPEN=1` disables the gate for local development only — never
+  in production.
+* Static assets (HTML/CSS/JS) are public; only `/api/*` is gated. The HTML is
+  served `no-store` so an auth change cannot be masked by a cached bundle.
+* Private chats are stored under `cache/dm-<chat>.json`; every read is filtered
+  by the *verified* Telegram user id, so a thread is only visible to its two
+  participants.
 
 ## Reverse proxy (Caddy)
 

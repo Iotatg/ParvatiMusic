@@ -6,6 +6,9 @@
 <meta name="theme-color" content="#000000" />
 <title>Parvati Music</title>
 <link rel="stylesheet" href="assets/css/app.css" />
+<!-- Telegram WebApp SDK: without it window.Telegram.WebApp (and therefore the
+     signed initData the server verifies) does not exist. -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
   // Glass panels (backdrop-filter) are the most expensive thing this UI does,
   // and Telegram's Android WebView runs them on the CPU for cheap phones.

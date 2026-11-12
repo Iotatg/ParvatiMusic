@@ -11,6 +11,11 @@ parvati-ntg = { path = "../ntg" }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "gzip"] }
 libc = "0.2"
+# Telegram WebApp initData is authenticated with HMAC-SHA256
+# (secret = HMAC("WebAppData", bot_token)). Both crates are already in the
+# workspace lock file, so this adds no new download.
+hmac = "0.13"
+sha2 = "0.11"
 ferogram = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 

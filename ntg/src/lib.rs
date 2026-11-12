@@ -20,6 +20,15 @@ pub const STATE_CLOSED: c_int = 4;
 
 // ntg_stream_mode_enum
 pub const STREAM_CAPTURE: c_int = 0;
+pub const STREAM_PLAYBACK: c_int = 1;
+
+// ntg_device_enum — the device whose source ended. A video track runs *two*
+// ffmpeg pipes (microphone + camera); a camera EOF must never be mistaken for
+// the song ending.
+pub const DEVICE_MICROPHONE: c_int = 0;
+pub const DEVICE_SPEAKER: c_int = 1;
+pub const DEVICE_CAMERA: c_int = 2;
+pub const DEVICE_SCREEN: c_int = 3;
 
 // ntg_media_source_enum (bitmask)
 pub const SOURCE_SHELL: c_int = 1 << 1;
@@ -167,7 +176,7 @@ fn future_message(f: &Future) -> String {
 // Client
 // ---------------------------------------------------------------------------
 
-pub type OnStreamEnd = std::sync::Arc<dyn Fn(i64) + Send + Sync>;
+pub type OnStreamEnd = std::sync::Arc<dyn Fn(i64, c_int, c_int) + Send + Sync>;
 pub type OnConnectionChange = std::sync::Arc<dyn Fn(i64, bool, String) + Send + Sync>;
 
 #[derive(Clone)]
@@ -213,11 +222,14 @@ unsafe extern "C" fn log_cb(m: LogMessage) {
     log::info!(target: "ntgcore", "{lvl} [{file}:{}] {msg}", m.line);
 }
 
-unsafe extern "C" fn stream_end_cb(_ptr: usize, chat: i64, _t: c_int, _d: c_int, ud: *mut c_void) {
+unsafe extern "C" fn stream_end_cb(_ptr: usize, chat: i64, t: c_int, d: c_int, ud: *mut c_void) {
     let shared = unsafe { &*(ud as *const Shared) };
     let cbs: Vec<OnStreamEnd> = shared.stream_end.lock().unwrap().clone();
     for cb in cbs {
-        cb(chat);
+        // Pass the stream mode and the device through: the room must only
+        // advance when the *audio* source ended, not when the video pipe hit
+        // EOF / a broken pipe.
+        cb(chat, t, d);
     }
 }
 

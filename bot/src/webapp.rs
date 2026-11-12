@@ -62,6 +62,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+
 use crate::assistant::AssistantManager;
 use crate::models::Track;
 use crate::platforms::iota::ProgressFn;
@@ -178,8 +181,23 @@ pub struct MiniApp {
     /// One roster pass at a time: a burst of requests used to start several
     /// 25-call member lookups at once, which is what made the app stutter.
     roster_busy: AtomicBool,
-    /// Optional shared secret (`MINIAPP_TOKEN`). Empty = open (dev / LAN).
+    /// Optional shared secret (`MINIAPP_TOKEN`) for trusted integrations. It
+    /// never grants a *user* identity — only the control plane.
     token: String,
+    /// Bot token. Telegram derives the WebApp `initData` secret from it, so
+    /// only this bot's WebApp can mint credentials the server accepts.
+    bot_token: String,
+    /// Optional allow-list of Telegram user ids (`MINIAPP_ALLOWED_IDS`).
+    /// Empty = any user whose `initData` verifies.
+    allowed_ids: Vec<i64>,
+    /// Reject `initData` older than this (seconds, `MINIAPP_AUTH_MAX_AGE`).
+    auth_max_age: u64,
+    /// Require the verified user to be a participant of the mirrored chat
+    /// (`MINIAPP_REQUIRE_MEMBER`, default on). A cold roster cannot verify
+    /// anybody, so it passes until the first roster pass lands.
+    require_member: bool,
+    /// Explicit dev escape hatch (`MINIAPP_ALLOW_OPEN=1`). Never on in prod.
+    allow_open: bool,
 }
 
 static APP: OnceLock<Arc<MiniApp>> = OnceLock::new();
@@ -497,6 +515,20 @@ pub fn install(rooms: Rooms) {
         sleep_at: Mutex::new(0),
         roster_busy: AtomicBool::new(false),
         token: env_str("MINIAPP_TOKEN", ""),
+        bot_token: {
+            let t = env_str("TOKEN", "");
+            if t.trim().is_empty() { env_str("BOT_TOKEN", "") } else { t }
+        },
+        allowed_ids: env_str("MINIAPP_ALLOWED_IDS", "")
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .collect(),
+        auth_max_age: env_str("MINIAPP_AUTH_MAX_AGE", "86400")
+            .trim()
+            .parse()
+            .unwrap_or(86_400),
+        require_member: env_str("MINIAPP_REQUIRE_MEMBER", "1") != "0",
+        allow_open: env_str("MINIAPP_ALLOW_OPEN", "0") == "1",
     });
     let _ = APP.set(hub.clone());
     // The chat survives restarts: names, tags, stickers and text come back
@@ -595,17 +627,300 @@ fn playback_json(r: &RoomState) -> Value {
     })
 }
 
+/// A verified request identity. `user_id` is only set when Telegram signed the
+/// `initData` — a static token or the dev escape hatch never impersonate a user.
+struct Auth {
+    ok: bool,
+    user_id: Option<i64>,
+    name: String,
+    username: String,
+    /// "initdata" | "token" | "open" | "not-member" | "not-allowed" | "none"
+    via: &'static str,
+}
+
+impl Auth {
+    fn denied() -> Auth {
+        Auth {
+            ok: false,
+            user_id: None,
+            name: String::new(),
+            username: String::new(),
+            via: "none",
+        }
+    }
+
+    /// The identity to use for `me`. A verified user always wins over whatever
+    /// the client sent, which is what stops impersonation.
+    fn me(&self, fallback: String) -> String {
+        match self.user_id {
+            Some(id) => id.to_string(),
+            None => fallback,
+        }
+    }
+
+    fn display_name(&self, fallback: String) -> String {
+        if !self.name.is_empty() {
+            self.name.clone()
+        } else if !self.username.is_empty() {
+            self.username.clone()
+        } else {
+            fallback
+        }
+    }
+}
+
+/// Constant-time comparison of two lowercase hex digests.
+fn ct_eq_hex(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// How long a Telegram membership answer is trusted before asking again.
+const AUTH_MEMBER_TTL: u64 = 300;
+
+/// id → (allowed, checked_at) for verified users missing from the cached
+/// roster (large groups: the roster only carries the first 200 participants).
+fn auth_members() -> &'static Mutex<std::collections::HashMap<i64, (bool, u64)>> {
+    static C: OnceLock<Mutex<std::collections::HashMap<i64, (bool, u64)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `secret = HMAC_SHA256("WebAppData", bot_token)`,
+/// `hash   = HMAC_SHA256(secret, sorted "k=v" lines)`.
+fn tg_init_data_hash(bot_token: &str, fields: &[(String, String)]) -> Option<String> {
+    let mut lines: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    lines.sort();
+    let check = lines.join("\n");
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut secret = HmacSha256::new_from_slice(b"WebAppData").ok()?;
+    secret.update(bot_token.as_bytes());
+    let secret = secret.finalize().into_bytes();
+
+    let mut mac = HmacSha256::new_from_slice(&secret).ok()?;
+    mac.update(check.as_bytes());
+    Some(to_hex(&mac.finalize().into_bytes()))
+}
+
+/// Verify a Telegram WebApp `initData` string. Returns
+/// `(user_id, display_name, username)` when the signature and the timestamp
+/// are valid.
+fn verify_tg_init_data(
+    bot_token: &str,
+    max_age: u64,
+    raw: &str,
+) -> Option<(i64, String, String)> {
+    if raw.is_empty() || bot_token.is_empty() {
+        return None;
+    }
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut hash = String::new();
+    for part in raw.split('&') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if k == "hash" {
+            hash = v.to_ascii_lowercase();
+        } else {
+            fields.push((k.to_string(), urldecode(v)));
+        }
+    }
+    if hash.is_empty() {
+        return None;
+    }
+
+    // Telegram added `signature` (Ed25519) next to `hash`. The HMAC covers
+    // every field except `hash`; some clients also drop `signature`, so accept
+    // either construction.
+    let mut valid = tg_init_data_hash(bot_token, &fields)
+        .map(|c| ct_eq_hex(&c, &hash))
+        .unwrap_or(false);
+    if !valid {
+        let no_sig: Vec<(String, String)> = fields
+            .iter()
+            .filter(|(k, _)| k != "signature")
+            .cloned()
+            .collect();
+        valid = tg_init_data_hash(bot_token, &no_sig)
+            .map(|c| ct_eq_hex(&c, &hash))
+            .unwrap_or(false);
+    }
+    if !valid {
+        return None;
+    }
+
+    // Freshness: a leaked initData must not be replayable forever.
+    let auth_date = fields
+        .iter()
+        .find(|(k, _)| k == "auth_date")
+        .and_then(|(_, v)| v.parse::<u64>().ok())?;
+    let now = now_secs();
+    if auth_date > now + 300 || now.saturating_sub(auth_date) > max_age {
+        return None;
+    }
+
+    let user: Value = fields
+        .iter()
+        .find(|(k, _)| k == "user")
+        .and_then(|(_, v)| serde_json::from_str(v).ok())?;
+    let id = user["id"].as_i64()?;
+    let first = user["first_name"].as_str().unwrap_or("");
+    let last = user["last_name"].as_str().unwrap_or("");
+    let name = format!("{first} {last}").trim().to_string();
+    let username = user["username"].as_str().unwrap_or("").to_string();
+    Some((id, name, username))
+}
+
 impl MiniApp {
-    /// Token check: `X-MiniApp-Token` header or `?token=` (EventSource cannot
-    /// set headers, so the query form has to exist).
-    fn authorized(&self, req: &Request) -> bool {
-        if self.token.is_empty() {
+    /// Authenticate a request. The only identity that counts is the one
+    /// Telegram signed in `initData`; anything the client sends as `me` is
+    /// ignored once a real user is known.
+    fn authorize(&self, req: &Request) -> Auth {
+        // initData arrives three ways: a header (fetch), the query string
+        // (EventSource / <video> cannot set headers) or the cookie the page
+        // sets once, which covers <img>/<video>/SSE automatically.
+        let raw = req
+            .init_data
+            .clone()
+            .or_else(|| qs(&req.query, "init"))
+            .or_else(|| qs(&req.query, "initData"))
+            .or_else(|| req.cookies.get("parvati_auth").cloned())
+            .unwrap_or_default();
+
+        if !raw.is_empty() {
+            if let Some((id, name, username)) = self.verify_init_data(&raw) {
+                if !self.allowed_ids.is_empty() && !self.allowed_ids.contains(&id) {
+                    return Auth {
+                        ok: false,
+                        user_id: Some(id),
+                        name,
+                        username,
+                        via: "not-allowed",
+                    };
+                }
+                if !self.member_ok(id) {
+                    return Auth {
+                        ok: false,
+                        user_id: Some(id),
+                        name,
+                        username,
+                        via: "not-member",
+                    };
+                }
+                return Auth {
+                    ok: true,
+                    user_id: Some(id),
+                    name,
+                    username,
+                    via: "initdata",
+                };
+            }
+        }
+
+        // Trusted integration: a static token grants control, never a user id.
+        if !self.token.is_empty() {
+            let ok = qs(&req.query, "token").as_deref() == Some(self.token.as_str())
+                || req.header_token.as_deref() == Some(self.token.as_str());
+            if ok {
+                return Auth {
+                    ok: true,
+                    user_id: None,
+                    name: String::new(),
+                    username: String::new(),
+                    via: "token",
+                };
+            }
+        }
+
+        // Explicit dev escape hatch (MINIAPP_ALLOW_OPEN=1).
+        if self.allow_open {
+            return Auth {
+                ok: true,
+                user_id: None,
+                name: String::new(),
+                username: String::new(),
+                via: "open",
+            };
+        }
+
+        Auth::denied()
+    }
+
+    /// Validate Telegram WebApp `initData`:
+    /// `secret = HMAC_SHA256("WebAppData", bot_token)`,
+    /// `hash   = HMAC_SHA256(secret, sorted "k=v" lines)`.
+    fn verify_init_data(&self, raw: &str) -> Option<(i64, String, String)> {
+        verify_tg_init_data(&self.bot_token, self.auth_max_age, raw)
+    }
+
+    /// A verified Telegram user still has to belong to the mirrored room.
+    fn member_ok(&self, id: i64) -> bool {
+        if !self.require_member || self.allowed_ids.contains(&id) {
             return true;
         }
-        if let Some(t) = qs(&req.query, "token") {
-            return t == self.token;
+        if std::env::var("OWNER_ID")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            == Some(id)
+        {
+            return true;
         }
-        req.header_token.as_deref() == Some(self.token.as_str())
+        let sid = id.to_string();
+        let members = self.members.lock().unwrap_or_else(|e| e.into_inner());
+        // A cold roster cannot prove anything; let the request through and let
+        // the first roster pass decide.
+        if members.is_empty() {
+            return true;
+        }
+        if members.iter().any(|m| m["id"].as_str() == Some(sid.as_str())) {
+            return true;
+        }
+        drop(members);
+
+        // Not in the cached roster: the roster only holds the first 200
+        // participants, so ask Telegram once and remember the answer.
+        let now = now_secs();
+        {
+            let cache = auth_members().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ok, at)) = cache.get(&id) {
+                if now.saturating_sub(*at) < AUTH_MEMBER_TTL {
+                    return *ok;
+                }
+            }
+        }
+        let status = tg_json(&format!(
+            "/member?chat_id={}&user_id={id}",
+            self.active_chat()
+        ))
+        .and_then(|v| v["status"].as_str().map(|s| s.to_string()));
+        let ok = match status.as_deref() {
+            Some("creator") | Some("administrator") | Some("member") | Some("restricted") => true,
+            Some("left") | Some("kicked") => false,
+            // Bridge offline / unexpected answer: never lock a real user out.
+            _ => true,
+        };
+        auth_members()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (ok, now));
+        ok
     }
 
     /// Chat the app mirrors: the configured one when it already has a room,
@@ -630,7 +945,7 @@ impl MiniApp {
         self.rooms.room_for(self.active_chat())
     }
 
-    fn snapshot(&self, with_chat: bool) -> Value {
+    fn snapshot(&self, with_chat: bool, viewer: Option<&Auth>) -> Value {
         let room = self.room();
         let (mut playback, room_active, cur_track) = match room.as_ref() {
             Some(r) => {
@@ -692,11 +1007,38 @@ impl MiniApp {
         let title = self.title.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let count = *self.member_count.lock().unwrap_or_else(|e| e.into_inner());
         let invite = self.invite.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let me = members
-            .iter()
-            .find(|m| m["host"] == true)
-            .or_else(|| members.iter().find(|m| m["role"] == "owner"))
-            .cloned()
+        // `me` is the *viewer*, not the room owner: the profile header must
+        // show the person who opened the app. When the roster is cold the row
+        // is built from the signed identity, so it is never the wrong person.
+        let vid = viewer.and_then(|a| a.user_id);
+        let me = vid
+            .and_then(|id| {
+                let sid = id.to_string();
+                members
+                    .iter()
+                    .find(|m| m["id"].as_str() == Some(sid.as_str()))
+                    .cloned()
+            })
+            .or_else(|| {
+                viewer.filter(|a| a.user_id.is_some()).map(|a| {
+                    let id = a.user_id.unwrap_or(0);
+                    json!({
+                        "id": id.to_string(),
+                        "name": if a.name.is_empty() { "you".to_string() } else { a.name.clone() },
+                        "username": a.username.clone(),
+                        "photo": format!("/api/avatar/{id}"),
+                        "role": "member",
+                        "status": "member",
+                        "custom": "",
+                        "tags": [{"k":"member","label":"MEMBER"}],
+                        "vc": false,
+                        "host": false,
+                        "bot": false,
+                    })
+                })
+            })
+            .or_else(|| members.iter().find(|m| m["host"] == true).cloned())
+            .or_else(|| members.iter().find(|m| m["role"] == "owner").cloned())
             .unwrap_or(Value::Null);
         let session = self.session_json(live);
 
@@ -903,8 +1245,8 @@ impl MiniApp {
     /// one sent are skipped: the app re-renders the whole screen per frame, so
     /// repeating the same payload every tick was the main source of jank.
     /// `first` forces a full frame for a newly connected client.
-    fn broadcast(&self, res: &mut TcpStream, first: bool) -> std::io::Result<()> {
-        let mut state_val = self.snapshot(false);
+    fn broadcast(&self, res: &mut TcpStream, first: bool, viewer: Option<&Auth>) -> std::io::Result<()> {
+        let mut state_val = self.snapshot(false, viewer);
         let state = json!({ "type": "state", "data": state_val.clone() }).to_string();
         // The playhead moves every second, which used to make *every* frame a
         // "change" and re-render the whole app. Compare without `position`
@@ -1810,11 +2152,21 @@ fn handle(app: Arc<MiniApp>, mut stream: TcpStream) -> std::io::Result<()> {
     };
 
     let path = req.path.clone();
-    if path.starts_with("/api/") && !app.authorized(&req) {
-        return respond_json(&mut stream, 401, &json!({ "error": "unauthorized" }));
+    let auth = app.authorize(&req);
+    if path.starts_with("/api/") && !auth.ok {
+        let hint = match auth.via {
+            "not-member" => "You are not a member of this room.",
+            "not-allowed" => "This account is not allowed here.",
+            _ => "Open this app from Telegram.",
+        };
+        return respond_json(
+            &mut stream,
+            401,
+            &json!({ "error": "unauthorized", "reason": auth.via, "hint": hint }),
+        );
     }
     if path == "/api/events" {
-        return stream_events(app, stream);
+        return stream_events(app, stream, auth);
     }
     if path.starts_with("/api/") {
         if serve_media(&app, &mut stream, &req) {
@@ -1823,7 +2175,7 @@ fn handle(app: Arc<MiniApp>, mut stream: TcpStream) -> std::io::Result<()> {
         if serve_image(&app, &mut stream, &req) {
             return Ok(());
         }
-        let (code, body) = route_api(&app, &req);
+        let (code, body) = route_api(&app, &req, &auth);
         return respond_json(&mut stream, code, &body);
     }
     serve_static(&app, &mut stream, &path)
@@ -1835,6 +2187,10 @@ struct Request {
     query: String,
     body: Vec<u8>,
     header_token: Option<String>,
+    /// `X-Telegram-Init-Data` — the signed Telegram WebApp payload.
+    init_data: Option<String>,
+    /// Parsed `Cookie` header (only `parvati_auth` is read).
+    cookies: std::collections::HashMap<String, String>,
     /// `Range: bytes=a-b` — only the media stream uses it, so it is parsed
     /// once here instead of growing a full header map.
     range: Option<String>,
@@ -1872,6 +2228,8 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
 
     let mut len = 0usize;
     let mut header_token = None;
+    let mut init_data = None;
+    let mut cookies = std::collections::HashMap::new();
     let mut range = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -1879,6 +2237,16 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
                 len = v.trim().parse().unwrap_or(0);
             } else if k.eq_ignore_ascii_case("x-miniapp-token") {
                 header_token = Some(v.trim().to_string());
+            } else if k.eq_ignore_ascii_case("x-telegram-init-data") {
+                // Header values are percent-encoded by the page so the raw
+                // `&`/`=` inside initData survive the header.
+                init_data = Some(urldecode(v.trim()));
+            } else if k.eq_ignore_ascii_case("cookie") {
+                for pair in v.trim().split(';') {
+                    if let Some((ck, cv)) = pair.trim().split_once('=') {
+                        cookies.insert(ck.trim().to_string(), urldecode(cv.trim()));
+                    }
+                }
             } else if k.eq_ignore_ascii_case("range") {
                 range = Some(v.trim().to_string());
             }
@@ -1894,7 +2262,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     }
     body.truncate(len.min(MAX_BODY));
 
-    Ok(Some(Request { method, path, query, body, header_token, range }))
+    Ok(Some(Request { method, path, query, body, header_token, init_data, cookies, range }))
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2336,7 +2704,7 @@ fn merge_obj(dst: &mut serde_json::Map<String, Value>, src: &Value) {
     }
 }
 
-fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
+fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
     let body: Value = if req.body.is_empty() {
         json!({})
     } else {
@@ -2353,7 +2721,7 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
                 thread::spawn(move || hub.refresh_roster());
             }
         }
-        return (200, app.snapshot(true));
+        return (200, app.snapshot(true, Some(auth)));
     }
 
     // ── Profile card: tap a name or avatar in the chat / member list. ──
@@ -2455,7 +2823,7 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
     // "Add to Stickers": the viewer's personal saved list. A GET is cheap and
     // never touches Telegram, so the Saved tab opens instantly even offline.
     if req.method == "GET" && req.path == "/api/stickers/saved" {
-        let me = qs(&req.query, "me").unwrap_or_default();
+        let me = auth.me(qs(&req.query, "me").unwrap_or_default());
         if me.is_empty() || me.len() > 64 {
             return (400, json!({ "error": "me" }));
         }
@@ -2531,7 +2899,7 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
     }
 
     if req.method == "GET" && req.path == "/api/dm" {
-        let me = qs(&req.query, "me").unwrap_or_default();
+        let me = auth.me(qs(&req.query, "me").unwrap_or_default());
         if me.is_empty() {
             return (400, json!({ "error": "me" }));
         }
@@ -2705,12 +3073,15 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
             // Preview/seed path: store the message for this instance only.
             // Handy for screenshots and demos without posting to the group.
             if body["local"].as_bool().unwrap_or(false) {
-                let sender_id = body["senderId"].as_str().unwrap_or("").to_string();
+                let sender_id = auth.me(body["senderId"].as_str().unwrap_or("").to_string());
+                let sender_name = auth.display_name(
+                    body["senderName"].as_str().unwrap_or("member").to_string(),
+                );
                 let msg = json!({
                     "id": format!("loc{}", now_ms()),
                     "mid": 0,
                     "from": sender_id,
-                    "name": body["senderName"].as_str().unwrap_or("member"),
+                    "name": sender_name,
                     "photo": if sender_id.is_empty() { String::new() } else { format!("/api/avatar/{sender_id}") },
                     "tags": body.get("tags").cloned().unwrap_or(json!([])),
                     "mine": false,
@@ -2734,8 +3105,11 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
 
             match tg_post("/send", &req_body) {
                 Some((code, res)) if code == 200 && res["ok"] == true => {
-                    let sender_id = body["senderId"].as_str().unwrap_or("").to_string();
-                    let sender_name = body["senderName"].as_str().unwrap_or("you").to_string();
+                    // Attribute the message to the verified Telegram user, not
+                    // to whatever id the client put in the body.
+                    let sender_id = auth.me(body["senderId"].as_str().unwrap_or("").to_string());
+                    let sender_name =
+                        auth.display_name(body["senderName"].as_str().unwrap_or("you").to_string());
                     let mid = res["message_id"].as_i64().unwrap_or(0);
                     let msg = json!({
                         "id": format!("l{mid}"),
@@ -2824,7 +3198,7 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
             }
         }
         "/api/stickers/saved" => {
-            let me = body["me"].as_str().unwrap_or("").to_string();
+            let me = auth.me(body["me"].as_str().unwrap_or("").to_string());
             if me.is_empty() || me.len() > 64 {
                 return (400, json!({ "error": "me" }));
             }
@@ -2886,19 +3260,22 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
             }
         }
         "/api/session/end" => {
-            let by = body["name"].as_str().unwrap_or("mini app").to_string();
-            let id: i64 = body["id"]
-                .as_str()
-                .and_then(|s| s.trim().parse().ok())
-                .or_else(|| body["id"].as_i64())
-                .unwrap_or(0);
+            let by = auth.display_name(body["name"].as_str().unwrap_or("mini app").to_string());
+            let id: i64 = match auth.user_id {
+                Some(id) => id,
+                None => body["id"]
+                    .as_str()
+                    .and_then(|s| s.trim().parse().ok())
+                    .or_else(|| body["id"].as_i64())
+                    .unwrap_or(0),
+            };
             if !end_session(app.active_chat(), id, &by, "app") {
                 return (404, json!({ "error": "no active voice chat" }));
             }
             return (200, json!({ "ok": true, "session": app.session_json(false) }));
         }
         "/api/dm/send" => {
-            let me = body["me"].as_str().unwrap_or_default().to_string();
+            let me = auth.me(body["me"].as_str().unwrap_or_default().to_string());
             let peer = body["peer"].as_str().unwrap_or_default().to_string();
             let text = body["text"].as_str().unwrap_or("").trim().to_string();
             if me.is_empty() || peer.is_empty() || me == peer {
@@ -2943,10 +3320,10 @@ fn route_api(app: &MiniApp, req: &Request) -> (u16, Value) {
         _ => return (404, json!({ "error": "not found" })),
     }
 
-    (200, app.snapshot(true))
+    (200, app.snapshot(true, Some(auth)))
 }
 
-fn stream_events(app: Arc<MiniApp>, mut stream: TcpStream) -> std::io::Result<()> {
+fn stream_events(app: Arc<MiniApp>, mut stream: TcpStream, auth: Auth) -> std::io::Result<()> {
     stream.write_all(
         b"HTTP/1.1 200 OK\r\n\
           Content-Type: text/event-stream\r\n\
@@ -2958,7 +3335,7 @@ fn stream_events(app: Arc<MiniApp>, mut stream: TcpStream) -> std::io::Result<()
     let mut first = true;
     let mut idle = 0u32;
     loop {
-        match app.broadcast(&mut stream, first) {
+        match app.broadcast(&mut stream, first, Some(&auth)) {
             Ok(()) => {}
             Err(_) => break,
         }
@@ -3003,8 +3380,15 @@ fn serve_static(app: &MiniApp, stream: &mut TcpStream, path: &str) -> std::io::R
         _ => "application/octet-stream",
     };
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: public, max-age=600\r\nConnection: close\r\n\r\n",
-        bytes.len()
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nConnection: close\r\n\r\n",
+        bytes.len(),
+        // The HTML and the auth bootstrap must never be served stale: a cached
+        // app.js from before an auth change would leave the app in a 401 loop.
+        cache = if mime == MIME_HTML {
+            "no-store"
+        } else {
+            "public, max-age=60"
+        },
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(&bytes)?;
@@ -3197,5 +3581,60 @@ impl MiniApp {
     /// Force a roster refresh on the next `/api/state`.
     pub fn invalidate_roster(&self) {
         *self.roster_at.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    const TOKEN: &str = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+    // Cross-checked against an independent Python HMAC-SHA256 implementation.
+    const HASH: &str = "6083fcffa5274993fead6c2e2e738dbfd50855b262eaae13bb4f6dad7d646b27";
+    const RAW: &str = "auth_date=1730000000&query_id=AAHdF6IQAAAAAN0XohDhrOrc&user=%7B%22id%22%3A42%2C%22first_name%22%3A%22Test%22%2C%22last_name%22%3A%22User%22%2C%22username%22%3A%22testuser%22%2C%22language_code%22%3A%22en%22%7D&hash=6083fcffa5274993fead6c2e2e738dbfd50855b262eaae13bb4f6dad7d646b27";
+
+    #[test]
+    fn hmac_matches_reference_vector() {
+        let fields = vec![
+            ("auth_date".to_string(), "1730000000".to_string()),
+            ("query_id".to_string(), "AAHdF6IQAAAAAN0XohDhrOrc".to_string()),
+            (
+                "user".to_string(),
+                r#"{"id":42,"first_name":"Test","last_name":"User","username":"testuser","language_code":"en"}"#
+                    .to_string(),
+            ),
+        ];
+        assert_eq!(tg_init_data_hash(TOKEN, &fields).as_deref(), Some(HASH));
+    }
+
+    #[test]
+    fn valid_init_data_yields_the_verified_user() {
+        let (id, name, username) = verify_tg_init_data(TOKEN, u64::MAX, RAW).expect("valid");
+        assert_eq!(id, 42);
+        assert_eq!(name, "Test User");
+        assert_eq!(username, "testuser");
+    }
+
+    #[test]
+    fn tampered_payload_is_rejected() {
+        // Same hash, different user id: the HMAC no longer matches.
+        let forged = RAW.replace("%22id%22%3A42", "%22id%22%3A43");
+        assert!(verify_tg_init_data(TOKEN, u64::MAX, &forged).is_none());
+    }
+
+    #[test]
+    fn wrong_bot_token_is_rejected() {
+        assert!(verify_tg_init_data("999:wrong", u64::MAX, RAW).is_none());
+    }
+
+    #[test]
+    fn stale_init_data_is_rejected() {
+        // auth_date is 2024-11-01, so a one-hour window must refuse it.
+        assert!(verify_tg_init_data(TOKEN, 3600, RAW).is_none());
+    }
+
+    #[test]
+    fn missing_init_data_is_rejected() {
+        assert!(verify_tg_init_data(TOKEN, u64::MAX, "").is_none());
     }
 }
