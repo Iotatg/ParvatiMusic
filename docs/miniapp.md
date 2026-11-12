@@ -116,6 +116,43 @@ link/mention/hashtag/custom emoji), replies, photos, voice notes and stickers.
 Media is fetched over MTProto on a background task and served from
 `/api/tgmedia/<key>`.
 
+### One chat per group
+
+The hub keeps **one message queue per Telegram group**
+(`Mutex<HashMap<i64, VecDeque<Value>>>`). It used to keep a single global
+queue, which mixed every group into one timeline and persisted whichever chat
+happened to be "playing" at save time — a second group therefore looked like it
+had no chat at all, and switching rooms showed somebody else's messages.
+
+| Piece | Stored at | Notes |
+| --- | --- | --- |
+| Message queue | `cache/mirror-<chat_id>.json` | One file per group, capped at 300 messages, written atomically (tmp + rename) |
+| Chat registry | `cache/chats.json` | id, title, member count, last-message preview, activity stamp; capped at 40 rows |
+| Viewing position | in memory, `user id → chat id` | Each viewer switches chats independently |
+| Read stamps | in memory, `uid:chat → date` | Unread badges are per viewer *and* per chat |
+
+* `note_chat(chat_id)` registers a group on the **first update of any kind**,
+  including textless service messages (bot added, member joined). A newly
+  joined group therefore appears in the switcher before anyone types. Its real
+  title is resolved from Telegram once, on a background thread.
+* `push_incoming` writes to `ev.chat_id`, so a message can never be mirrored
+  into the wrong group. Reply previews are resolved against that group's own
+  queue only.
+* `/api/chat/send`, `/react`, `/delete`, `/clear` and `/read` all operate on
+  the chat the **verified viewer** selected — never on the room that happens
+  to be playing. The client cannot pass a `chat` id to override this.
+* SSE frames carry a `chat` id; the app discards a frame for a chat it just
+  left, so a late message cannot be painted into the new one.
+* Ending a voice chat clears **only that group's** mirror. Other groups keep
+  their history.
+
+The switcher (`chatSwitch` → **Group chats** sheet) lists every known group
+with its live flag, a last-message preview and an unread badge; the selected
+chat is pinned to the top. Tapping a row switches instantly. Each row can be
+deleted (removed from the app, not from Telegram) and the current chat can be
+cleared. Both actions are admin/owner-only and confirmed with
+`WebApp.showPopup`.
+
 Two things made messages silently disappear and are now handled:
 
 * **The update stream ends.** A network blip or an unappliable `getDifference`
@@ -172,9 +209,19 @@ menu. All of it is additive — no existing playback or mirroring path changed.
 
 The action sheet has a reaction bar (`❤️ 👍 🔥 🥰 😂 😮 😢 🎉`) and a grid of
 Reply, Copy text, Forward, Add to Stickers, React, View profile and Delete.
-Delete is only offered for your own messages or when the viewer is an admin,
-uses `WebApp.showPopup` for confirmation when available, and removes the row
-from the persisted mirror so the next SSE frame cannot paint it back.
+Delete uses `WebApp.showPopup` for confirmation when available, calls
+`/api/chat/delete` for the **current chat**, and removes the row from that
+chat's persisted mirror so the next SSE frame cannot paint it back. The server
+makes the permission decision from the signed identity (author, admin of that
+chat, or deployment owner) — the client's own `mine` flag is only a UI hint.
+A local-only bubble (`local: true`, `mid: 0`) never reached Telegram, so it is
+purged from the mirror directly with the same author/admin check. Reactions are
+persisted too, so a heart survives a restart.
+
+Admin answers for groups other than the playing room are cached for 120 s
+(`/api/chats` refreshes them when the switcher opens); the 1.5 s state stream
+only reads the cache. That keeps the delete buttons stable without putting a
+Telegram bridge call on every tick.
 
 **Gesture arbitration.** Tap-to-reply fires after 350 ms, double-tap-to-❤️
 inside 340 ms, long-press after 470 ms and swipe after 12 px of horizontal
@@ -194,8 +241,13 @@ handler.
 | `GET /api/avatar/<uid>?s=32..320` | profile photo at a requested size (default 96) |
 | `GET /api/stickers/saved?me=` | the viewer's saved stickers |
 | `POST /api/stickers/saved` | `{me, action: add\|remove\|clear, sticker\|id}` — per-viewer `cache/stickers-<me>.json`, deduped, capped at 120 |
-| `POST /api/chat/delete` | `{mid}` — `deleteMessage` + drop from the mirrored queue |
-| `POST /api/chat/send` | now also accepts `mediaKey` for stickers |
+| `POST /api/chat/delete` | `{mid, id?}` — `deleteMessage` + drop from that chat's mirror; `mid: 0` removes a local bubble |
+| `GET /api/chats` | chat list with unread counts and delete permissions (also refreshes group titles) |
+| `POST /api/chat/select` | `{id}` — switch the viewer to another group chat |
+| `POST /api/chat/forget` | `{id}` — delete/clear a chat in the app, Telegram untouched |
+| `POST /api/chat/clear` | wipe the current chat's mirrored history (admin only) |
+| `POST /api/chat/read` | mark the current chat read for this viewer |
+| `POST /api/chat/send` | now also accepts `mediaKey` for stickers; posts to the selected chat |
 
 The Bot API sidecar (`tools/tgapi.py`) gained `GET /user` (`getChat` for a
 private-chat object plus `getUserProfilePhotos`) and multipart `sendSticker`.
@@ -420,6 +472,15 @@ sync with what happens in Telegram.
 * Private chats are stored under `cache/dm-<chat>.json`; every read is filtered
   by the *verified* Telegram user id, so a thread is only visible to its two
   participants.
+* Destructive chat actions (`delete`, `clear`, `forget`) are authorized on the
+  server from the verified id. A shared link cannot delete somebody else's
+  message, and a client cannot choose a different group to act on: the target
+  chat comes from the server-side `user id → chat id` map. The playing room is
+  checked against its local roster, other groups against `getChatMember` via
+  the Bot API bridge.
+* Group messages, chat metadata and switcher state are all keyed by chat id.
+  There is no global message queue left to leak one group's history into
+  another viewer's session.
 
 ## Reverse proxy (Caddy)
 
@@ -459,9 +520,14 @@ The mini app talks to one loopback service, both started by `tools/run.sh`:
 | 8099 | `tools/downloader.py` | Iota-compatible yt-dlp service |
 
 `tools/supervise.sh [--tunnel]` keeps tgapi, the downloader, the bot and (with
-`--tunnel`) a cloudflared quick tunnel alive while you iterate; when the tunnel
-comes back it re-points the chat menu button automatically. Use systemd in
-production.
+`--tunnel`) a cloudflared quick tunnel alive while you iterate. A quick tunnel
+gets a **new hostname on every reconnect**, so the supervisor probes the public
+URL (not just the process) every few seconds, follows the newest hostname in
+`logs/tunnel.log`, re-points the chat menu button only when that URL actually
+changes, and recycles the tunnel after three failed probes — the failure mode
+users see as "cloudflare is down". Only hostnames written by the freshly started
+tunnel are trusted, so a stale line in the log can never leave the menu button
+pointing at a dead address. Use systemd in production.
 
 **`TGAPI_KEY` must match on both sides.** The Rust hub loads `.env` and sends
 its `TGAPI_KEY` as the `x-tgapi-key` header on every request to the bridge;

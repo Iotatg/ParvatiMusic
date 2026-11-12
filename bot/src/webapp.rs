@@ -38,9 +38,14 @@
 //!   POST /api/queue/clear      {}
 //!   POST /api/play             { id } | { query }
 //!   POST /api/skip             {}
+//!   GET  /api/chats            one row per group (title, preview, unread, permissions)
 //!   POST /api/chat/send        { text, kind, sticker, mediaKey, entities, replyTo }
 //!   POST /api/chat/react       { mid, emoji }
-//!   POST /api/chat/delete      { mid } — delete a mirrored message
+//!   POST /api/chat/delete      { mid, id? } — delete a mirrored message
+//!   POST /api/chat/select      { id } — switch the viewer to another group chat
+//!   POST /api/chat/forget      { id } — remove a chat from the app (Telegram untouched)
+//!   POST /api/chat/clear       wipe the current chat's mirror
+//!   POST /api/chat/read        mark the current chat read for this viewer
 //!   POST /api/stickers/saved   { me, action: add|remove, sticker|id }
 //!   POST /api/members          { id, action: promote|demote|kick|ban|unban }
 //!   POST /api/session/end      { id, name } — stop, leave, clear, summarise
@@ -74,6 +79,8 @@ use crate::room::{RoomState, Rooms};
 const MAX_BODY: usize = 64 * 1024;
 const CHAT_CAP: usize = 300;
 const ROSTER_TTL: u64 = 20;
+/// How long a "user X is admin of group Y" answer stays usable.
+const ADMIN_TTL: u64 = 120;
 
 /* ─────────────────────────── hooks ─────────────────────────── */
 
@@ -127,7 +134,28 @@ pub struct MiniApp {
     chat_id: i64,
     title: Mutex<String>,
     dir: PathBuf,
-    messages: Mutex<VecDeque<Value>>,
+    /// Mirrored messages, **one deque per chat**. A single global queue mixed
+    /// every group the bot sits in into one timeline (and persisted whichever
+    /// chat happened to be "active" at save time), which is why a second group
+    /// looked like it had no chat of its own.
+    chats: Mutex<HashMap<i64, VecDeque<Value>>>,
+    /// Chat registry: id → `{id, title, kind, members, last_text, last_date}`.
+    /// Drives the chat list and survives restarts (`cache/chats.json`).
+    chat_meta: Mutex<HashMap<i64, Value>>,
+    /// Chats whose `cache/mirror-<id>.json` was already read from disk.
+    chats_loaded: Mutex<std::collections::HashSet<i64>>,
+    /// Which chat each viewer is looking at (`user id → chat id`).
+    view_chat: Mutex<HashMap<i64, i64>>,
+    /// `(user id, chat id) → (is admin, checked at)`. Chat-list frames are
+    /// built every 1.5 s; asking the Telegram bridge about every other group
+    /// on each tick stalled the SSE loop. `/api/chats` refreshes the entries,
+    /// the stream only reads them.
+    admin_cache: Mutex<HashMap<(i64, i64), (bool, u64)>>,
+    /// `uid:chat` → newest message date that viewer has seen (unread badge).
+    last_read: Mutex<HashMap<String, i64>>,
+    /// Root of the JSON caches. Injectable so the per-chat tests never write
+    /// into the live `cache/` directory.
+    cache_dir: PathBuf,
     /// Full roster: administrators from the Bot API + everyone who talked.
     members: Mutex<Vec<Value>>,
     /// Everyone seen talking (id → display data), merged into the roster.
@@ -162,11 +190,8 @@ pub struct MiniApp {
     pending: Mutex<Value>,
     /// Last playback failure ({title, error, at}) — the app shows it once.
     play_error: Mutex<Value>,
-    /// Last JSON pushed over SSE. Unchanged frames are skipped, so an idle
-    /// room costs a keepalive instead of a full re-render every 1.5 s.
-    last_state: Mutex<String>,
-    last_state_at: Mutex<u64>,
-    last_chat: Mutex<String>,
+    /// Last JSON pushed over SSE is tracked per connection (`Cursor`): sharing
+    /// one string between viewers made one client's frame suppress the rest.
     /// True when the last roster pass got a real group-call participant list.
     /// Without it the app must not hide messages by "in voice" (it would hide
     /// everyone), so it falls back to showing the whole mirrored chat.
@@ -487,7 +512,13 @@ pub fn install(rooms: Rooms) {
         chat_id,
         title: Mutex::new(env_str("MINIAPP_ROOM_TITLE", "voice chat")),
         dir,
-        messages: Mutex::new(VecDeque::new()),
+        chats: Mutex::new(HashMap::new()),
+        chat_meta: Mutex::new(HashMap::new()),
+        chats_loaded: Mutex::new(std::collections::HashSet::new()),
+        view_chat: Mutex::new(HashMap::new()),
+        admin_cache: Mutex::new(HashMap::new()),
+        last_read: Mutex::new(HashMap::new()),
+        cache_dir: PathBuf::from("cache"),
         members: Mutex::new(Vec::new()),
         seen: Mutex::new(Vec::new()),
         member_count: Mutex::new(0),
@@ -506,9 +537,6 @@ pub fn install(rooms: Rooms) {
         dms: Mutex::new(Vec::new()),
         pending: Mutex::new(Value::Null),
         play_error: Mutex::new(Value::Null),
-        last_state: Mutex::new(String::new()),
-        last_state_at: Mutex::new(0),
-        last_chat: Mutex::new(String::new()),
         vc_known: Mutex::new(false),
         recent: Mutex::new(Vec::new()),
         favs: Mutex::new(Vec::new()),
@@ -531,9 +559,10 @@ pub fn install(rooms: Rooms) {
         allow_open: env_str("MINIAPP_ALLOW_OPEN", "0") == "1",
     });
     let _ = APP.set(hub.clone());
-    // The chat survives restarts: names, tags, stickers and text come back
-    // from cache/mirror-<chat>.json instead of an empty Chat tab.
-    hub.load_chat();
+    // Chats survive restarts: names, tags, stickers and text come back from
+    // cache/mirror-<id>.json instead of an empty Chat tab. The registry is read
+    // first so the switcher has every group the bot already knows.
+    hub.load_chats();
     hub.load_dms();
     hub.load_library();
 
@@ -649,6 +678,11 @@ impl Auth {
         }
     }
 
+    /// Verified Telegram user id (0 when the request carried no identity).
+    fn id(&self) -> i64 {
+        self.user_id.unwrap_or(0)
+    }
+
     /// The identity to use for `me`. A verified user always wins over whatever
     /// the client sent, which is what stops impersonation.
     fn me(&self, fallback: String) -> String {
@@ -658,8 +692,7 @@ impl Auth {
         }
     }
 
-    fn display_name(&self, fallback: String) -> String {
-        if !self.name.is_empty() {
+    fn display_name(&self, fallback: String) -> String {        if !self.name.is_empty() {
             self.name.clone()
         } else if !self.username.is_empty() {
             self.username.clone()
@@ -1120,16 +1153,47 @@ impl MiniApp {
         out["playback"]["pending"] = self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone();
         out["playback"]["error"] = self.play_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if with_chat {
-            let messages: Vec<Value> = self
-                .messages
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .cloned()
-                .collect();
-            out["messages"] = json!(messages);
+            let chat = self.chat_for(viewer);
+            out["messages"] = json!(self.chat_msgs(chat));
+            // Header + switcher for the chat the viewer actually picked. The
+            // room block above stays on the *playing* room, so the player tab
+            // never points at a group that has no voice chat.
+            out["chat"] = self.chat_head(chat, viewer);
+            out["chats"] = json!(self.chat_list(viewer));
         }
         out
+    }
+
+    /// Header block for one chat: id, display title, member count, live flag
+    /// and whether this viewer may clear its mirrored history.
+    fn chat_head(&self, chat: i64, viewer: Option<&Auth>) -> Value {
+        let meta = self
+            .chat_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chat)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let title = meta["title"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| {
+                if chat == self.chat_id {
+                    self.title.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                } else {
+                    format!("Chat {chat}")
+                }
+            });
+        json!({
+            "id": chat.to_string(),
+            "title": title,
+            "members": meta["members"].as_u64().unwrap_or(0),
+            "live": self.rooms.room_for(chat).is_some(),
+            "can_clear": viewer
+                .map(|a| self.is_owner(a) || self.is_admin_of(a, chat, false))
+                .unwrap_or(false),
+        })
     }
 
     /* ── session lifecycle ── */
@@ -1206,8 +1270,7 @@ impl MiniApp {
         *self.session_tracks.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Value::Null;
         if clear_chat {
-            self.messages.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            self.save_chat(); // drops the on-disk copy too
+            self.clear_chat(chat_id);
         }
         {
             let mut members = self.members.lock().unwrap_or_else(|e| e.into_inner());
@@ -1245,8 +1308,22 @@ impl MiniApp {
     /// one sent are skipped: the app re-renders the whole screen per frame, so
     /// repeating the same payload every tick was the main source of jank.
     /// `first` forces a full frame for a newly connected client.
-    fn broadcast(&self, res: &mut TcpStream, first: bool, viewer: Option<&Auth>) -> std::io::Result<()> {
+    fn broadcast(
+        &self,
+        res: &mut TcpStream,
+        first: bool,
+        viewer: Option<&Auth>,
+        cur: &mut Cursor,
+    ) -> std::io::Result<()> {
         let mut state_val = self.snapshot(false, viewer);
+        // The switcher rides on the state stream too. Without it the chat list
+        // only refreshed on a manual /api/state, so a group the bot had just
+        // joined stayed invisible until the app was reopened.
+        if let Some(o) = state_val.as_object_mut() {
+            let chat = self.chat_for(viewer);
+            o.insert("chat".to_string(), self.chat_head(chat, viewer));
+            o.insert("chats".to_string(), json!(self.chat_list(viewer)));
+        }
         let state = json!({ "type": "state", "data": state_val.clone() }).to_string();
         // The playhead moves every second, which used to make *every* frame a
         // "change" and re-render the whole app. Compare without `position`
@@ -1257,51 +1334,104 @@ impl MiniApp {
         }
         let sig = state_val.to_string();
         let now = now_secs();
-        let changed = {
-            let mut last = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
-            let mut at = self.last_state_at.lock().unwrap_or_else(|e| e.into_inner());
-            let drift = now.saturating_sub(*at) >= 5;
-            if first || *last != sig || drift {
-                *last = sig;
-                *at = now;
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
+        let drift = now.saturating_sub(cur.at) >= 5;
+        if first || cur.state != sig || drift {
+            cur.state = sig;
+            cur.at = now;
             write!(res, "data: {state}\n\n")?;
         }
 
-        let messages = {
-            let q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
-            json!({ "type": "messages", "data": q.iter().cloned().collect::<Vec<Value>>() })
-                .to_string()
-        };
-        let changed = {
-            let mut last = self.last_chat.lock().unwrap_or_else(|e| e.into_inner());
-            if first || *last != messages {
-                *last = messages.clone();
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
+        let chat = self.chat_for(viewer);
+        let messages = json!({
+            "type": "messages",
+            "chat": chat.to_string(),
+            "data": self.chat_msgs(chat),
+        })
+        .to_string();
+        if first || cur.messages != messages {
+            cur.messages = messages.clone();
             write!(res, "data: {messages}\n\n")?;
         }
         res.flush()
     }
 
-    fn push_message(&self, msg: Value) {
+    /* ── per-chat message store ── */
+
+    /// Chat this viewer is looking at. Falls back to the playing room when the
+    /// viewer never picked one (or picked a chat that has since vanished).
+    fn chat_for(&self, viewer: Option<&Auth>) -> i64 {
+        if let Some(a) = viewer {
+            let picked = self
+                .view_chat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&a.id())
+                .copied();
+            if let Some(id) = picked {
+                if self.chat_known(id) {
+                    return id;
+                }
+            }
+        }
+        self.active_chat()
+    }
+
+    fn chat_known(&self, id: i64) -> bool {
+        id == self.chat_id
+            || self.rooms.room_for(id).is_some()
+            || self
+                .chat_meta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id)
+    }
+
+    /// Read `cache/mirror-<id>.json` once, on first touch.
+    fn ensure_chat(&self, chat: i64) {
+        if !self
+            .chats_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat)
         {
-            let mut q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
+            return;
+        }
+        self.load_chat(chat);
+    }
+
+    fn chat_msgs(&self, chat: i64) -> Vec<Value> {
+        self.ensure_chat(chat);
+        self.chats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chat)
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn chat_msgs_for(&self, chat: i64, mid: i64) -> Option<Value> {
+        if mid == 0 {
+            return None;
+        }
+        self.ensure_chat(chat);
+        self.chats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chat)
+            .and_then(|q| q.iter().find(|m| m["mid"].as_i64() == Some(mid)).cloned())
+    }
+
+    fn push_message(&self, chat: i64, msg: Value) {
+        self.ensure_chat(chat);
+        {
+            let mut map = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+            let q = map.entry(chat).or_default();
             if let Some(mid) = msg.get("mid").and_then(|v| v.as_i64()) {
                 if mid != 0 {
                     if let Some(slot) = q.iter_mut().find(|m| m["mid"].as_i64() == Some(mid)) {
                         *slot = msg;
-                        drop(q);
-                        self.save_chat();
+                        drop(map);
+                        self.save_chat(chat);
                         return;
                     }
                 }
@@ -1311,24 +1441,103 @@ impl MiniApp {
                 q.pop_front();
             }
         }
-        self.save_chat();
+        self.save_chat(chat);
+    }
+
+    /// Remove one message from a chat. Returns true when something was removed.
+    /// Replies that pointed at it are unlinked so the UI never renders a
+    /// "reply to a message that no longer exists" stub.
+    fn drop_message(&self, chat: i64, mid: i64) -> bool {
+        if mid == 0 {
+            return false;
+        }
+        self.ensure_chat(chat);
+        let removed = {
+            let mut map = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(q) = map.get_mut(&chat) else {
+                return false;
+            };
+            let before = q.len();
+            q.retain(|m| m["mid"].as_i64() != Some(mid));
+            let removed = q.len() != before;
+            if removed {
+                for m in q.iter_mut() {
+                    if m["reply"]["mid"].as_i64() == Some(mid) {
+                        if let Some(o) = m.as_object_mut() {
+                            o.remove("reply");
+                        }
+                    }
+                }
+            }
+            removed
+        };
+        if removed {
+            self.save_chat(chat);
+        }
+        removed
+    }
+
+    fn clear_chat(&self, chat: i64) {
+        self.ensure_chat(chat);
+        self.chats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&chat);
+        self.save_chat(chat);
+    }
+
+    /// Delete a chat from the app for good: registry row, mirrored messages,
+    /// the on-disk mirror, and every viewer's "last read" stamp for it.
+    /// Telegram is untouched — the group and its history stay where they are.
+    /// The bot's home chat is never removed, only cleared, so the switcher can
+    /// never lose the room the app was configured for.
+    fn forget_chat(&self, chat: i64) {
+        self.clear_chat(chat);
+        let _ = std::fs::remove_file(self.chat_file(chat));
+        self.admin_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, c), _| *c != chat);
+        if chat == self.chat_id {
+            return;
+        }
+        self.chat_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&chat);
+        self.view_chat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, id| *id != chat);
+        let suffix = format!(":{chat}");
+        self.last_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.ends_with(&suffix));
+        self.chats_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&chat);
+        self.save_chats();
     }
 
     /* ── chat persistence ── */
 
-    /// Where the mirrored chat is kept between restarts.
-    fn chat_file(&self) -> PathBuf {
-        PathBuf::from("cache").join(format!("mirror-{}.json", self.active_chat()))
+    /// Where one mirrored chat is kept between restarts.
+    fn chat_file(&self, chat: i64) -> PathBuf {
+        self.cache_dir.join(format!("mirror-{chat}.json"))
     }
 
-    /// Write the Chat tab to disk so a restart does not wipe it. Atomic
+    /// Write one chat to disk so a restart does not wipe it. Atomic
     /// (tmp + rename) — a half-written file would break the next boot.
-    fn save_chat(&self) {
+    fn save_chat(&self, chat: i64) {
         let list: Vec<Value> = {
-            let q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
-            q.iter().cloned().collect()
+            let map = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&chat)
+                .map(|q| q.iter().cloned().collect())
+                .unwrap_or_default()
         };
-        let path = self.chat_file();
+        let path = self.chat_file(chat);
         if list.is_empty() {
             let _ = std::fs::remove_file(&path);
             return;
@@ -1336,22 +1545,23 @@ impl MiniApp {
         let Ok(body) = serde_json::to_vec(&list) else {
             return;
         };
-        let _ = std::fs::create_dir_all("cache");
+        let _ = std::fs::create_dir_all(&self.cache_dir);
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, body).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
 
-    /// Restore the last mirrored chat (names, tags, stickers, text) on boot.
-    fn load_chat(&self) {
-        let Ok(raw) = std::fs::read(self.chat_file()) else {
+    /// Restore one mirrored chat (names, tags, stickers, text) from disk.
+    fn load_chat(&self, chat: i64) {
+        let Ok(raw) = std::fs::read(self.chat_file(chat)) else {
             return;
         };
         let Ok(list) = serde_json::from_slice::<Vec<Value>>(&raw) else {
             return;
         };
-        let mut q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let q = map.entry(chat).or_default();
         for m in list.into_iter().rev().take(CHAT_CAP).rev() {
             // Older builds mirrored Telegram service messages; they render as
             // empty bubbles, so drop them while restoring the cache.
@@ -1362,6 +1572,249 @@ impl MiniApp {
             }
             q.push_back(m);
         }
+    }
+
+    /* ── chat registry ── */
+
+    /// Record a chat so it shows up in the switcher. `title`/`members` are
+    /// only overwritten when known, so a message arriving before the roster
+    /// pass cannot blank out a real name.
+    fn touch_chat(&self, chat: i64, title: Option<&str>, members: Option<usize>) {
+        if chat == 0 {
+            return;
+        }
+        let mut changed;
+        {
+            let mut meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+            changed = !meta.contains_key(&chat);
+            let row = meta
+                .entry(chat)
+                .or_insert_with(|| json!({ "id": chat.to_string(), "title": "", "kind": "group" }));
+            if let Some(t) = title {
+                let t = t.trim();
+                if !t.is_empty() && row["title"].as_str() != Some(t) {
+                    row["title"] = json!(t);
+                    changed = true;
+                }
+            }
+            if let Some(n) = members {
+                if n > 0 && row["members"].as_u64() != Some(n as u64) {
+                    row["members"] = json!(n);
+                    changed = true;
+                }
+            }
+            if row["title"].as_str().unwrap_or("").is_empty() {
+                row["title"] = json!(format!("Chat {chat}"));
+                changed = true;
+            }
+        }
+        // Every mirrored message used to rewrite chats.json. Only a new group
+        // or genuinely new metadata is worth a disk write.
+        if changed {
+            self.save_chats();
+        }
+    }
+
+    fn chats_file(&self) -> PathBuf {
+        self.cache_dir.join("chats.json")
+    }
+
+    /// Fill in a chat's real title and member count from Telegram. Runs off the
+    /// request thread: the bridge can be slow, and a nameless chat is not worth
+    /// blocking a switch on.
+    fn resolve_chat_meta(&self, chat: i64) {
+        if chat == 0 {
+            return;
+        }
+        let Some(info) = tg_json(&format!("/chat?chat_id={chat}")) else {
+            return;
+        };
+        let title = info["title"].as_str().unwrap_or("");
+        let members = info["members"].as_u64().map(|n| n as usize);
+        self.touch_chat(chat, Some(title), members);
+    }
+
+    fn save_chats(&self) {
+        let list: Vec<Value> = {
+            let meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+            let mut v: Vec<Value> = meta.values().cloned().collect();
+            // Newest activity first; the registry is capped so a bot sitting in
+            // dozens of groups cannot grow this file without bound.
+            v.sort_by(|a, b| {
+                b["last_date"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    .cmp(&a["last_date"].as_i64().unwrap_or(0))
+            });
+            v.truncate(40);
+            v
+        };
+        let Ok(body) = serde_json::to_vec(&list) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        let path = self.chats_file();
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn load_chats(&self) {
+        let Ok(raw) = std::fs::read(self.chats_file()) else {
+            return;
+        };
+        let Ok(list) = serde_json::from_slice::<Vec<Value>>(&raw) else {
+            return;
+        };
+        let mut meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+        for row in list {
+            if let Some(id) = row["id"].as_str().and_then(|s| s.parse::<i64>().ok()) {
+                meta.insert(id, row);
+            }
+        }
+    }
+
+    /// Bump the "last message" preview of a chat (drives list ordering).
+    fn note_chat_activity(&self, chat: i64, text: &str, ts: &str, date: i64) {
+        {
+            let mut meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+            let row = meta
+                .entry(chat)
+                .or_insert_with(|| json!({ "id": chat.to_string(), "title": format!("Chat {chat}"), "kind": "group" }));
+            row["last_text"] = json!(text.chars().take(80).collect::<String>());
+            row["last_ts"] = json!(ts);
+            row["last_date"] = json!(date);
+        }
+        self.save_chats();
+    }
+
+    /// Unread count for a viewer: messages newer than their last read stamp.
+    fn unread_for(&self, chat: i64, viewer: Option<&Auth>) -> usize {
+        let Some(a) = viewer else { return 0 };
+        let key = format!("{}:{}", a.id(), chat);
+        let seen = self
+            .last_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        self.chat_msgs(chat)
+            .iter()
+            .filter(|m| m["date"].as_i64().unwrap_or(0) > seen)
+            .filter(|m| m["from"].as_str() != Some(a.id().to_string().as_str()))
+            .count()
+    }
+
+    fn mark_read(&self, chat: i64, viewer: Option<&Auth>) {
+        let Some(a) = viewer else { return };
+        let newest = self
+            .chat_msgs(chat)
+            .iter()
+            .map(|m| m["date"].as_i64().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let key = format!("{}:{}", a.id(), chat);
+        let mut map = self.last_read.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = map.entry(key).or_insert(0);
+        if newest > *slot {
+            *slot = newest;
+        }
+    }
+
+    /// The chat list the switcher renders. Permission flags come from the
+    /// short-lived cache, so a state frame never waits on the Telegram bridge;
+    /// `/api/chats` warms that cache before the sheet opens.
+    fn chat_list(&self, viewer: Option<&Auth>) -> Vec<Value> {
+        let active = self.chat_for(viewer);
+        // Snapshot the registry first: `is_admin_of` takes the member roster
+        // lock, and holding the registry lock across it would invert the lock
+        // order used by `refresh_roster` (members → registry).
+        let mut src: Vec<(i64, Value)> = {
+            let meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+            meta.iter().map(|(id, row)| (*id, row.clone())).collect()
+        };
+        // A group can have a live room before it has a single message (the bot
+        // joins the call first). It still deserves its own chat row.
+        for (id, _) in self.rooms.all_rooms() {
+            if !src.iter().any(|(x, _)| *x == id) {
+                src.push((
+                    id,
+                    json!({ "id": id.to_string(), "title": "", "kind": "group" }),
+                ));
+            }
+        }
+        let mut rows: Vec<Value> = Vec::new();
+        for (id, mut r) in src {
+            r["id"] = json!(id.to_string());
+            if r["title"].as_str().unwrap_or("").trim().is_empty() {
+                r["title"] = json!(if id == self.chat_id {
+                    self.title.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                } else {
+                    format!("Chat {id}")
+                });
+            }
+            r["live"] = json!(self.rooms.room_for(id).is_some());
+            r["active"] = json!(id == active);
+            r["unread"] = json!(self.unread_for(id, viewer));
+            r["can_delete"] = json!(match viewer {
+                Some(a) => self.is_owner(a) || self.is_admin_of(a, id, false),
+                None => false,
+            });
+            rows.push(r);
+        }
+        // The configured chat always exists, even before its first message.
+        if !rows.iter().any(|r| r["id"].as_str() == Some(active.to_string().as_str())) {
+            let title = self.title.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            rows.push(json!({
+                "id": active.to_string(),
+                "title": title,
+                "kind": "group",
+                "last_text": "",
+                "last_ts": "",
+                "last_date": 0,
+                "live": self.rooms.room_for(active).is_some(),
+                "active": true,
+                "unread": 0,
+                "can_delete": false,
+            }));
+        }
+        rows.sort_by(|a, b| {
+            // The chat you are in stays on top, then newest activity first.
+            b["active"]
+                .as_bool()
+                .unwrap_or(false)
+                .cmp(&a["active"].as_bool().unwrap_or(false))
+                .then(
+                    b["last_date"]
+                        .as_i64()
+                        .unwrap_or(0)
+                        .cmp(&a["last_date"].as_i64().unwrap_or(0)),
+                )
+        });
+        rows
+    }
+
+    /// The list for the switcher: refresh permission flags first, then build
+    /// the rows. State frames call `chat_list` directly and stay network-free.
+    fn chat_list_warmed(&self, viewer: Option<&Auth>) -> Vec<Value> {
+        if let Some(a) = viewer {
+            let mut ids: Vec<i64> = self
+                .chat_meta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .copied()
+                .collect();
+            for (id, _) in self.rooms.all_rooms() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            self.warm_admin_cache(a, &ids);
+        }
+        self.chat_list(viewer)
     }
 
     /* ── private chat ── */
@@ -1597,6 +2050,87 @@ impl MiniApp {
         roster.iter().find(|m| m["id"].as_str() == Some(id)).cloned()
     }
 
+    /// Deployment owner (`OWNER_ID`) or one of the bot's own accounts.
+    fn is_owner(&self, auth: &Auth) -> bool {
+        if std::env::var("OWNER_ID")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            == Some(auth.id())
+        {
+            return true;
+        }
+        host_ids().contains(&auth.id())
+    }
+
+    /// Administrator of *this* chat. `refresh = true` re-asks Telegram (an
+    /// actual permission check, or the switcher opening); `false` only reads
+    /// the short cache so a 1.5 s state frame never blocks on the network.
+    /// The playing room is answered from its local roster, which is always
+    /// current and needs no cache at all.
+    fn is_admin_of(&self, auth: &Auth, chat: i64, refresh: bool) -> bool {
+        if self.is_owner(auth) {
+            return true;
+        }
+        let sid = auth.id().to_string();
+        if chat == self.active_chat() {
+            let roster = self.members.lock().unwrap_or_else(|e| e.into_inner());
+            return roster
+                .iter()
+                .find(|m| m["id"].as_str() == Some(sid.as_str()))
+                .map(|m| {
+                    m["host"].as_bool().unwrap_or(false)
+                        || matches!(m["role"].as_str().unwrap_or(""), "owner" | "admin")
+                })
+                .unwrap_or(false);
+        }
+        let key = (auth.id(), chat);
+        let now = now_secs();
+        if !refresh {
+            return self
+                .admin_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .filter(|(_, at)| now.saturating_sub(*at) < ADMIN_TTL)
+                .map(|(ok, _)| *ok)
+                .unwrap_or(false);
+        }
+        let ok = match tg_json(&format!("/member?chat_id={chat}&user_id={sid}")) {
+            Some(m) => matches!(
+                m["status"].as_str().unwrap_or(""),
+                "creator" | "administrator" | "owner"
+            ),
+            None => false,
+        };
+        self.admin_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (ok, now));
+        ok
+    }
+
+    /// Fill in permission flags for the chats the switcher is about to show.
+    /// Only stale/missing entries are queried, and at most eight per open, so
+    /// a bot in many groups cannot turn one tap into a burst of bridge calls.
+    fn warm_admin_cache(&self, auth: &Auth, ids: &[i64]) {
+        let now = now_secs();
+        let stale: Vec<i64> = {
+            let cache = self.admin_cache.lock().unwrap_or_else(|e| e.into_inner());
+            ids.iter()
+                .copied()
+                .filter(|id| {
+                    !cache
+                        .get(&(auth.id(), *id))
+                        .map(|(_, at)| now.saturating_sub(*at) < ADMIN_TTL)
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+        for id in stale.into_iter().take(8) {
+            self.is_admin_of(auth, id, true);
+        }
+    }
+
     /* ── roster ── */
 
     fn refresh_roster(&self) {
@@ -1623,6 +2157,12 @@ impl MiniApp {
                     *self.invite.lock().unwrap_or_else(|e| e.into_inner()) = l.to_string();
                 }
             }
+            // Keep the switcher's name/member count in sync with the room.
+            self.touch_chat(
+                chat,
+                info["title"].as_str(),
+                info["members"].as_u64().map(|n| n as usize),
+            );
         }
 
         let mut list: Vec<Value> = Vec::new();
@@ -1726,16 +2266,15 @@ impl MiniApp {
     /* ── incoming chat ── */
 
     fn push_incoming(&self, ev: ChatEvent) {
-        // Mirror every message of the room's group. `active_chat()` can move
-        // while a room is being created, so the configured chat and any chat
-        // that already has a room count too — otherwise a message sent in the
-        // voice chat right after /play was silently dropped.
-        let mirrors = ev.chat_id == self.chat_id
-            || ev.chat_id == self.active_chat()
-            || self.rooms.room_for(ev.chat_id).is_some();
-        if !mirrors {
+        // Mirror every group the bot is in. `tracks_chat` used to accept only
+        // the *active* chat, so a second group produced no chat at all; each
+        // message now lands in its own per-chat queue instead of one shared
+        // timeline.
+        let chat = ev.chat_id;
+        if chat == 0 {
             return;
         }
+        self.touch_chat(chat, None, None);
         // Telegram's own housekeeping (join/leave/pin) has no author and no
         // text; painting it as "member: " just adds noise.
         if ev.sender_id == 0 && ev.text.trim().is_empty() {
@@ -1767,21 +2306,20 @@ impl MiniApp {
         }
 
         let reply = if ev.reply_to != 0 {
-            let q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
-            q.iter()
-                .find(|m| m["mid"].as_i64() == Some(ev.reply_to))
-                .map(|m| {
-                    json!({
-                        "mid": ev.reply_to,
-                        "name": m["name"].as_str().unwrap_or(""),
-                        "text": m["text"].as_str().unwrap_or(""),
-                    })
+            // Message ids are per chat: resolving against another group's queue
+            // attached the wrong author/text to a reply.
+            self.chat_msgs_for(chat, ev.reply_to).map(|m| {
+                json!({
+                    "mid": ev.reply_to,
+                    "name": m["name"].as_str().unwrap_or(""),
+                    "text": m["text"].as_str().unwrap_or(""),
                 })
+            })
         } else {
             None
         };
 
-        self.push_message(json!({
+        self.push_message(chat, json!({
             "id": format!("tg{}", ev.mid),
             "mid": ev.mid,
             "from": sid,
@@ -1799,6 +2337,19 @@ impl MiniApp {
             "ts": ev.ts,
             "date": ev.date,
         }));
+        // Preview + ordering for the chat list.
+        let preview = if ev.text.trim().is_empty() {
+            match ev.kind.as_str() {
+                "sticker" => format!("Sticker {}", ev.emoji).trim().to_string(),
+                "photo" => "Photo".to_string(),
+                "video" => "Video".to_string(),
+                "voice" => "Voice message".to_string(),
+                other => other.to_string(),
+            }
+        } else {
+            ev.text.clone()
+        };
+        self.note_chat_activity(chat, &preview, &ev.ts, ev.date);
     }
 }
 
@@ -2078,6 +2629,9 @@ fn start_track_async(chat_id: i64, rooms: Rooms, track: Track, force: bool) {
         // The mini app can start playback before any chat command created the
         // room, so create it on demand instead of dropping the track.
         let room = rooms.create_room(chat_id, true);
+        // A group that just got a voice chat needs its own chat row even before
+        // anyone types: the switcher is how you reach it.
+        app.touch_chat(chat_id, None, None);
         let mut g = room.lock().unwrap_or_else(|e| e.into_inner());
         if force {
             g.play(pick.clone(), path.clone(), true);
@@ -2194,6 +2748,25 @@ struct Request {
     /// `Range: bytes=a-b` — only the media stream uses it, so it is parsed
     /// once here instead of growing a full header map.
     range: Option<String>,
+}
+
+/// Per-SSE-connection frame dedupe. This used to live on `MiniApp`, which meant
+/// the first viewer's frame marked the payload "sent" for everybody else — two
+/// phones on the same room made each other's updates disappear.
+struct Cursor {
+    state: String,
+    messages: String,
+    at: u64,
+}
+
+impl Cursor {
+    fn new() -> Self {
+        Self {
+            state: String::new(),
+            messages: String::new(),
+            at: 0,
+        }
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
@@ -2772,19 +3345,30 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
 
         // 4) Local facts Telegram cannot expose (privacy): how much this
         //    person talked in the mirrored room chat and their last stamp.
-        let q = app.messages.lock().unwrap_or_else(|e| e.into_inner());
-        let posts: usize = q
+        //    Counted over every known chat, so a profile does not depend on
+        //    which tab the viewer happens to have open.
+        let msgs = {
+            let ids: Vec<i64> = {
+                let meta = app.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+                meta.keys().copied().collect()
+            };
+            let mut all: Vec<Value> = Vec::new();
+            for c in ids {
+                all.extend(app.chat_msgs(c));
+            }
+            all
+        };
+        let posts: usize = msgs
             .iter()
             .filter(|m| m["from"].as_str() == Some(id.as_str()))
             .count();
-        let last = q
+        let last = msgs
             .iter()
-            .rev()
-            .find(|m| m["from"].as_str() == Some(id.as_str()))
+            .filter(|m| m["from"].as_str() == Some(id.as_str()))
+            .max_by_key(|m| m["date"].as_i64().unwrap_or(0))
             .and_then(|m| m["ts"].as_str())
             .unwrap_or("")
             .to_string();
-        drop(q);
         out.insert("messages".to_string(), json!(posts));
         out.insert("last_seen".to_string(), json!(last));
         out.insert(
@@ -2914,6 +3498,39 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
         }
     }
 
+    // Chat switcher. The app refreshes it with a plain GET fetch, so it has
+    // to be handled before the POST-only router below (a GET falling through
+    // there used to answer 404 and the sheet never got its permissions).
+    if req.method == "GET" && req.path == "/api/chats" {
+        let list = app.chat_list_warmed(Some(auth));
+        // Groups seen only through a message carry a placeholder title. Ask
+        // Telegram for a few real names in the background; the next open fills
+        // in the rest so one tap cannot turn into a burst of bridge calls.
+        let unnamed: Vec<i64> = list
+            .iter()
+            .filter(|r| {
+                r["title"]
+                    .as_str()
+                    .map(|t| t.starts_with("Chat "))
+                    .unwrap_or(true)
+            })
+            .filter_map(|r| r["id"].as_str().and_then(|s| s.parse::<i64>().ok()))
+            .take(4)
+            .collect();
+        for id in unnamed {
+            if let Some(hub) = crate::webapp::app() {
+                thread::spawn(move || hub.resolve_chat_meta(id));
+            }
+        }
+        return (
+            200,
+            json!({
+                "chats": list,
+                "active": app.chat_for(Some(auth)).to_string(),
+            }),
+        );
+    }
+
     if req.method != "POST" {
         return (404, json!({ "error": "not found" }));
     }
@@ -3026,6 +3643,10 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             if kind == "text" && text.trim().is_empty() {
                 return (400, json!({ "error": "empty" }));
             }
+            // Send into the chat the viewer is looking at, not whichever room
+            // happens to be playing — otherwise a message typed in group B
+            // landed in group A's Telegram chat.
+            let target = app.chat_for(Some(&auth));
             let reply = body["replyTo"].as_i64().unwrap_or(0);
             // Keep the client's rich copy for local rendering, but only send
             // the fields the Bot API understands (it rejects unknown keys).
@@ -3052,7 +3673,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 })
                 .unwrap_or_default();
             let mut req_body = json!({
-                "chat_id": app.active_chat().to_string(),
+                "chat_id": target.to_string(),
                 "kind": kind,
                 "text": text,
                 "reply_to": reply,
@@ -3099,7 +3720,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     "date": now_secs() as i64,
                     "reacts": body.get("reacts").cloned().unwrap_or(json!([])),
                 });
-                app.push_message(msg.clone());
+                app.push_message(target, msg.clone());
                 return (200, json!({ "ok": true, "message": msg }));
             }
 
@@ -3133,7 +3754,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                         "ts": now_hm(),
                         "date": res["date"].as_i64().unwrap_or(now_secs() as i64),
                     });
-                    app.push_message(msg.clone());
+                    app.push_message(target, msg.clone());
                     return (200, json!({ "ok": true, "message": msg }));
                 }
                 Some((_, res)) => {
@@ -3148,16 +3769,31 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             if mid == 0 {
                 return (400, json!({ "error": "mid" }));
             }
+            let target = app.chat_for(Some(auth));
             let req_body = json!({
-                "chat_id": app.active_chat().to_string(),
+                "chat_id": target.to_string(),
                 "message_id": mid,
                 "emoji": emoji,
             });
             match tg_post("/react", &req_body) {
                 Some((code, _)) if code == 200 => {
-                    let mut q = app.messages.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(m) = q.iter_mut().find(|m| m["mid"].as_i64() == Some(mid)) {
-                        m["reacted"] = json!(emoji);
+                    // The queue must be loaded before it can be edited, and the
+                    // reaction has to survive a restart: without save_chat the
+                    // heart vanished on the next boot.
+                    app.ensure_chat(target);
+                    let mut changed = false;
+                    {
+                        let mut map = app.chats.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(m) = map
+                            .get_mut(&target)
+                            .and_then(|q| q.iter_mut().find(|m| m["mid"].as_i64() == Some(mid)))
+                        {
+                            m["reacted"] = json!(emoji);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        app.save_chat(target);
                     }
                     return (200, json!({ "ok": true }));
                 }
@@ -3166,36 +3802,165 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
         }
         "/api/chat/delete" => {
             let mid = body["mid"].as_i64().unwrap_or(0);
+            let local_id = body["id"].as_str().unwrap_or("");
+            let target = app.chat_for(Some(auth));
+
+            // A local-only bubble (`local:true`, mid 0) never reached Telegram,
+            // so it is removed from the mirror directly.
             if mid == 0 {
-                return (400, json!({ "error": "mid" }));
+                if local_id.is_empty() {
+                    return (400, json!({ "error": "mid" }));
+                }
+                app.ensure_chat(target);
+                let uid = auth.id().to_string();
+                // The client cannot be trusted to decide who may remove a
+                // local bubble: check its stored author against the verified id.
+                let mine = {
+                    let map = app.chats.lock().unwrap_or_else(|e| e.into_inner());
+                    map.get(&target)
+                        .and_then(|q| q.iter().find(|m| m["id"].as_str() == Some(local_id)))
+                        .map(|m| m["from"].as_str() == Some(uid.as_str()))
+                };
+                if mine.is_none() {
+                    return (404, json!({ "error": "not found" }));
+                }
+                if mine != Some(true) && !app.is_admin_of(auth, target, true) {
+                    return (403, json!({ "error": "not allowed" }));
+                }
+                let removed = {
+                    let mut map = app.chats.lock().unwrap_or_else(|e| e.into_inner());
+                    map.get_mut(&target)
+                        .map(|q| {
+                            let before = q.len();
+                            q.retain(|m| m["id"].as_str() != Some(local_id));
+                            q.len() != before
+                        })
+                        .unwrap_or(false)
+                };
+                if removed {
+                    app.save_chat(target);
+                }
+                return (200, json!({ "ok": true }));
             }
+
+            // Only a message that is actually mirrored here can be deleted
+            // from here. An arbitrary mid would otherwise send a pointless
+            // (and failing) deleteMessage to Telegram for every request.
+            let stored = app.chat_msgs_for(target, mid);
+            if stored.is_none() {
+                return (404, json!({ "error": "not found" }));
+            }
+            // Permission is decided here, from the verified identity: only the
+            // author or an administrator of *this* chat may delete. The client
+            // used to decide this alone, which meant any viewer could ask the
+            // bot to delete anybody's message.
+            let mine = stored
+                .as_ref()
+                .map(|m| m["from"].as_str() == Some(auth.id().to_string().as_str()))
+                .unwrap_or(false);
+            if !mine && !app.is_admin_of(auth, target, true) {
+                return (403, json!({ "error": "not allowed" }));
+            }
+
             let req_body = json!({
-                "chat_id": app.active_chat().to_string(),
+                "chat_id": target.to_string(),
                 "message_id": mid,
             });
             match tg_post("/delete", &req_body) {
                 Some((code, res)) if code == 200 => {
-                    // Drop it from the mirrored queue too, otherwise the next
-                    // SSE frame would paint the deleted bubble straight back.
-                    let mut q = app.messages.lock().unwrap_or_else(|e| e.into_inner());
-                    let kept: VecDeque<Value> = q
-                        .iter()
-                        .filter(|m| m["mid"].as_i64() != Some(mid))
-                        .cloned()
-                        .collect();
-                    *q = kept;
-                    drop(q);
-                    app.save_chat();
+                    // Drop it from the mirror too, otherwise the next SSE frame
+                    // would paint the deleted bubble straight back.
+                    app.drop_message(target, mid);
                     return (200, json!({ "ok": true }));
                 }
-                Some((_, res)) => {
+                Some((code, res)) => {
+                    // "message to delete not found" means it is already gone
+                    // upstream: keeping the bubble would leave a ghost that can
+                    // never be removed. Treat it as success and purge locally.
+                    let err = res["error"].as_str().unwrap_or("").to_lowercase();
+                    if code == 400
+                        && (err.contains("not found")
+                            || err.contains("message_id_invalid")
+                            || err.contains("message can't be deleted"))
+                    {
+                        app.drop_message(target, mid);
+                        return (200, json!({ "ok": true, "already": true }));
+                    }
                     return (
                         502,
                         json!({ "error": res["error"].as_str().unwrap_or("delete failed") }),
-                    )
+                    );
                 }
                 None => return (503, json!({ "error": "telegram bridge offline" })),
             }
+        }
+        "/api/chat/clear" => {
+            // Wipe the local mirror of one chat. Telegram is untouched: this is
+            // the "clear this chat in the app" action, useful when a room is
+            // reused and the old conversation is just noise.
+            let target = app.chat_for(Some(auth));
+            if !app.is_admin_of(auth, target, true) && !app.is_owner(auth) {
+                return (403, json!({ "error": "not allowed" }));
+            }
+            app.clear_chat(target);
+            app.mark_read(target, Some(auth));
+            return (200, json!({ "ok": true }));
+        }
+        "/api/chat/forget" => {
+            // Delete a chat from the app (not from Telegram). The bot's home
+            // chat is only cleared: removing it would drop the room the app is
+            // configured for and it would reappear on the next roster pass.
+            let id: i64 = body["id"]
+                .as_str()
+                .and_then(|s| s.trim().parse().ok())
+                .or_else(|| body["id"].as_i64())
+                .unwrap_or(0);
+            if id == 0 {
+                return (400, json!({ "error": "id" }));
+            }
+            if !app.chat_known(id) {
+                return (404, json!({ "error": "unknown chat" }));
+            }
+            if !app.is_admin_of(auth, id, true) {
+                return (403, json!({ "error": "not allowed" }));
+            }
+            let home = id == app.chat_id;
+            app.forget_chat(id);
+            let next = app.chat_for(Some(auth));
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "cleared": home,
+                    "active": next.to_string(),
+                    "chats": app.chat_list(Some(auth)),
+                }),
+            );
+        }
+        "/api/chat/select" => {
+            let id: i64 = body["id"]
+                .as_str()
+                .and_then(|s| s.trim().parse().ok())
+                .or_else(|| body["id"].as_i64())
+                .unwrap_or(0);
+            if id == 0 || !app.chat_known(id) {
+                return (404, json!({ "error": "unknown chat" }));
+            }
+            app.view_chat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(auth.id(), id);
+            app.mark_read(id, Some(auth));
+            // A chat picked for the first time may still be titled "Chat -100…".
+            if let Some(hub) = crate::webapp::app() {
+                thread::spawn(move || hub.resolve_chat_meta(id));
+            }
+            return (200, json!({ "ok": true, "chat": id.to_string() }));
+        }
+        "/api/chat/read" => {
+            let target = app.chat_for(Some(auth));
+            app.mark_read(target, Some(auth));
+            return (200, json!({ "ok": true }));
         }
         "/api/stickers/saved" => {
             let me = auth.me(body["me"].as_str().unwrap_or("").to_string());
@@ -3334,8 +4099,9 @@ fn stream_events(app: Arc<MiniApp>, mut stream: TcpStream, auth: Auth) -> std::i
     stream.flush()?;
     let mut first = true;
     let mut idle = 0u32;
+    let mut cur = Cursor::new();
     loop {
-        match app.broadcast(&mut stream, first, Some(&auth)) {
+        match app.broadcast(&mut stream, first, Some(&auth), &mut cur) {
             Ok(()) => {}
             Err(_) => break,
         }
@@ -3544,9 +4310,35 @@ pub fn ingest(ev: ChatEvent) {
 
 /// True when the mini app is mirroring `chat_id` (lets the bot skip work).
 pub fn tracks_chat(chat_id: i64) -> bool {
+    // Every group the bot is in is tracked; each one gets its own chat.
+    // Only the zero id (non-group updates) is refused.
     match app() {
-        Some(app) => app.active_chat() == chat_id,
+        Some(_) => chat_id != 0,
         None => false,
+    }
+}
+
+/// Register a group as soon as the bot sees *any* update from it. Service
+/// messages (bot added, member joined, call started) carry no text and are
+/// dropped by `ingest`, so without this a newly joined group stayed invisible
+/// in the switcher until somebody typed a real message.
+pub fn note_chat(chat_id: i64) {
+    if chat_id == 0 {
+        return;
+    }
+    let Some(hub) = app() else {
+        return;
+    };
+    let is_new = !hub
+        .chat_meta
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&chat_id);
+    hub.touch_chat(chat_id, None, None);
+    // Resolve the real title once per group. Retrying on every message would
+    // spawn a bridge call per update whenever Telegram is unreachable.
+    if is_new {
+        thread::spawn(move || hub.resolve_chat_meta(chat_id));
     }
 }
 
@@ -3554,7 +4346,8 @@ impl MiniApp {
     /// Mirror a chat message the bot posted into the room, so the mini app's
     /// Chat tab stays in sync with Telegram.
     pub fn note_message(&self, author: &str, text: &str) {
-        self.push_message(json!({
+        let chat = self.active_chat();
+        self.push_message(chat, json!({
             "id": format!("b{}", now_ms()),
             "mid": 0,
             "from": "bot",
@@ -3565,6 +4358,7 @@ impl MiniApp {
             "kind": "text",
             "text": text,
             "ts": now_hm(),
+            "date": now_secs() as i64,
         }));
     }
 
@@ -3636,5 +4430,287 @@ mod auth_tests {
     #[test]
     fn missing_init_data_is_rejected() {
         assert!(verify_tg_init_data(TOKEN, u64::MAX, "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    const HOME: i64 = -1001;
+    const OTHER: i64 = -1002;
+
+    fn unique_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "parvati-chat-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+        ))
+    }
+
+    fn app_in(chat_id: i64, cache_dir: PathBuf) -> MiniApp {
+        MiniApp {
+            rooms: Rooms::new(),
+            chat_id,
+            title: Mutex::new("Home group".to_string()),
+            dir: PathBuf::from("miniapp"),
+            chats: Mutex::new(HashMap::new()),
+            chat_meta: Mutex::new(HashMap::new()),
+            chats_loaded: Mutex::new(std::collections::HashSet::new()),
+            view_chat: Mutex::new(HashMap::new()),
+            admin_cache: Mutex::new(HashMap::new()),
+            last_read: Mutex::new(HashMap::new()),
+            cache_dir,
+            members: Mutex::new(Vec::new()),
+            seen: Mutex::new(Vec::new()),
+            member_count: Mutex::new(0),
+            invite: Mutex::new(String::new()),
+            settings: Mutex::new(json!({})),
+            quote: Mutex::new(String::new()),
+            live: Mutex::new(false),
+            session_started: Mutex::new(0),
+            session_tracks: Mutex::new(0),
+            last_session: Mutex::new(json!({})),
+            media: Mutex::new(HashMap::new()),
+            roster_at: Mutex::new(0),
+            search_cache: Mutex::new(Vec::new()),
+            dms: Mutex::new(Vec::new()),
+            pending: Mutex::new(Value::Null),
+            play_error: Mutex::new(Value::Null),
+            vc_known: Mutex::new(false),
+            recent: Mutex::new(Vec::new()),
+            favs: Mutex::new(Vec::new()),
+            sleep_at: Mutex::new(0),
+            roster_busy: AtomicBool::new(false),
+            token: String::new(),
+            bot_token: String::new(),
+            allowed_ids: Vec::new(),
+            auth_max_age: 86_400,
+            require_member: false,
+            allow_open: false,
+        }
+    }
+
+    fn app() -> (MiniApp, PathBuf) {
+        let dir = unique_dir();
+        (app_in(HOME, dir.clone()), dir)
+    }
+
+    fn viewer(id: i64) -> Auth {
+        Auth {
+            ok: true,
+            user_id: Some(id),
+            name: format!("User {id}"),
+            username: String::new(),
+            via: "initdata",
+        }
+    }
+
+    fn msg(mid: i64, from: &str, text: &str, date: i64) -> Value {
+        json!({
+            "id": format!("m{mid}"), "mid": mid, "from": from,
+            "name": from, "text": text, "kind": "text", "date": date,
+        })
+    }
+
+    fn event(chat: i64, mid: i64, sender: i64, text: &str, kind: &str) -> ChatEvent {
+        ChatEvent {
+            chat_id: chat,
+            mid,
+            sender_id: sender,
+            name: if sender == 0 {
+                String::new()
+            } else {
+                format!("User {sender}")
+            },
+            text: text.to_string(),
+            kind: kind.to_string(),
+            emoji: String::new(),
+            media: String::new(),
+            media_kind: String::new(),
+            reply_to: 0,
+            date: 100,
+            ts: "10:00".to_string(),
+            outgoing: false,
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn messages_are_isolated_per_chat() {
+        let (app, dir) = app();
+        app.touch_chat(OTHER, Some("Second group"), None);
+        app.push_message(HOME, msg(1, "11", "hello A", 10));
+        app.push_message(OTHER, msg(2, "22", "hello B", 20));
+        assert_eq!(app.chat_msgs(HOME).len(), 1);
+        assert_eq!(app.chat_msgs(OTHER)[0]["text"], "hello B");
+        assert!(app.drop_message(HOME, 1));
+        assert!(app.chat_msgs(HOME).is_empty());
+        assert_eq!(app.chat_msgs(OTHER).len(), 1);
+        // Deleting an id that belongs to the other group must not touch this one.
+        assert!(!app.drop_message(HOME, 2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleting_a_message_unlinks_replies() {
+        let (app, dir) = app();
+        app.push_message(HOME, msg(1, "11", "original", 10));
+        app.push_message(HOME, json!({
+            "id": "m2", "mid": 2, "from": "22", "name": "22",
+            "text": "re", "kind": "text", "date": 20,
+            "reply": { "mid": 1, "name": "11", "text": "original" },
+        }));
+        assert!(app.drop_message(HOME, 1));
+        let rest = app.chat_msgs(HOME);
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].get("reply").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clear_and_forget_leave_other_chats_alone() {
+        let (app, dir) = app();
+        app.touch_chat(OTHER, Some("Second group"), None);
+        app.push_message(HOME, msg(1, "11", "a", 10));
+        app.push_message(OTHER, msg(2, "22", "b", 20));
+        app.clear_chat(HOME);
+        assert!(app.chat_msgs(HOME).is_empty());
+        assert_eq!(app.chat_msgs(OTHER).len(), 1);
+        app.forget_chat(OTHER);
+        assert!(app.chat_msgs(OTHER).is_empty());
+        assert!(!app.chat_known(OTHER));
+        assert!(app.chat_known(HOME));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn home_chat_is_cleared_but_never_forgotten() {
+        let (app, dir) = app();
+        app.push_message(HOME, msg(1, "11", "a", 10));
+        app.forget_chat(HOME);
+        assert!(app.chat_known(HOME));
+        assert_eq!(app.chat_for(None), HOME);
+        assert!(app.chat_msgs(HOME).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn switcher_is_per_viewer_and_active_chat_is_first() {
+        let (app, dir) = app();
+        let a = viewer(7);
+        let b = viewer(8);
+        app.touch_chat(OTHER, Some("Second group"), None);
+        app.note_chat_activity(HOME, "newer", "12:00", 200);
+        app.note_chat_activity(OTHER, "older", "11:00", 100);
+        app.view_chat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(7, OTHER);
+        assert_eq!(app.chat_for(Some(&a)), OTHER);
+        assert_eq!(app.chat_for(Some(&b)), HOME);
+        let list = app.chat_list(Some(&a));
+        assert_eq!(list[0]["id"], OTHER.to_string());
+        assert_eq!(list[0]["active"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unread_stamps_are_per_chat_and_per_viewer() {
+        let (app, dir) = app();
+        let a = viewer(7);
+        app.touch_chat(OTHER, Some("Second group"), None);
+        app.push_message(HOME, msg(1, "99", "a", 10));
+        app.push_message(OTHER, msg(2, "99", "b", 20));
+        assert_eq!(app.unread_for(HOME, Some(&a)), 1);
+        assert_eq!(app.unread_for(OTHER, Some(&a)), 1);
+        app.mark_read(HOME, Some(&a));
+        assert_eq!(app.unread_for(HOME, Some(&a)), 0);
+        assert_eq!(app.unread_for(OTHER, Some(&a)), 1);
+        // Your own messages never count as unread.
+        app.push_message(HOME, msg(3, "7", "mine", 30));
+        assert_eq!(app.unread_for(HOME, Some(&a)), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn each_chat_persists_to_its_own_file() {
+        let dir = unique_dir();
+        let first = app_in(HOME, dir.clone());
+        first.touch_chat(OTHER, Some("Second group"), None);
+        first.push_message(HOME, msg(1, "11", "a", 10));
+        first.push_message(OTHER, msg(2, "22", "b", 20));
+        assert!(dir.join("mirror--1001.json").exists());
+        assert!(dir.join("mirror--1002.json").exists());
+        // Cold boot: registry first, then each queue on first touch.
+        let second = app_in(HOME, dir.clone());
+        second.load_chats();
+        assert_eq!(second.chat_msgs(HOME)[0]["text"], "a");
+        assert_eq!(second.chat_msgs(OTHER)[0]["text"], "b");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_history_is_capped() {
+        let (app, dir) = app();
+        for i in 1..=(CHAT_CAP as i64 + 5) {
+            app.push_message(HOME, msg(i, "11", "x", i));
+        }
+        let list = app.chat_msgs(HOME);
+        assert_eq!(list.len(), CHAT_CAP);
+        assert_eq!(list[0]["mid"], 6);
+        assert_eq!(list[CHAT_CAP - 1]["mid"], (CHAT_CAP + 5) as i64);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_group_gets_its_own_chat_on_the_first_message() {
+        let (app, dir) = app();
+        app.push_message(HOME, msg(1, "11", "home only", 10));
+
+        // A group the app has never seen before sends its first message.
+        app.push_incoming(event(OTHER, 900, 22, "hello from the new group", "text"));
+
+        let v = viewer(22);
+        let list = app.chat_list(Some(&v));
+        assert!(
+            list.iter()
+                .any(|r| r["id"].as_str() == Some(OTHER.to_string().as_str())),
+            "the new group must appear in the switcher"
+        );
+        assert_eq!(app.chat_msgs(HOME).len(), 1);
+        assert_eq!(app.chat_msgs(HOME)[0]["text"], "home only");
+        assert_eq!(app.chat_msgs(OTHER).len(), 1);
+        assert_eq!(app.chat_msgs(OTHER)[0]["text"], "hello from the new group");
+
+        // Later messages stay in their own timelines, never in one shared feed.
+        app.push_incoming(event(HOME, 901, 11, "back home", "text"));
+        assert_eq!(app.chat_msgs(HOME).len(), 2);
+        assert_eq!(app.chat_msgs(OTHER).len(), 1);
+        assert_eq!(app.chat_msgs(OTHER)[0]["text"], "hello from the new group");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_service_update_registers_the_group_without_an_empty_bubble() {
+        let (app, dir) = app();
+        // "bot was added to the group" has no author and no text. It must make
+        // the group visible in the switcher, but must not paint an empty bubble.
+        app.push_incoming(event(OTHER, 0, 0, "", "service"));
+
+        assert!(app.chat_known(OTHER), "the group must be registered");
+        let list = app.chat_list(None);
+        assert!(
+            list.iter()
+                .any(|r| r["id"].as_str() == Some(OTHER.to_string().as_str())),
+            "the group must be listed before any real message"
+        );
+        assert!(
+            app.chat_msgs(OTHER).is_empty(),
+            "a textless service update must not create a message"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

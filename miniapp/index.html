@@ -200,6 +200,12 @@
           <!-- ============ CHAT ============ -->
           <section class="view view-chat" data-view="chat">
             <div class="chat-head">
+              <button class="chat-switch" id="chatSwitch" aria-label="Switch group chat">
+                <span class="cs-dot" id="csDot"></span>
+                <span class="cs-name" id="chatName">chingu gang</span>
+                <svg class="ic cs-caret"><use href="#i-chevron"/></svg>
+                <span class="cs-badge" id="chatBadge" hidden>0</span>
+              </button>
               <div class="seg" id="chatSeg">
                 <button class="seg-btn is-on" data-scope="vc">
                   <svg class="ic ic-12"><use href="#i-mic"/></svg>
@@ -395,6 +401,25 @@
         <div class="sheet-grab"></div>
         <div class="sheet-title">Room settings</div>
         <div class="sheet-rows" id="settingsRows"></div>
+      </div>
+
+      <!-- ───────────── group chats (one per group) ───────────── -->
+      <div class="sheet chats-sheet" id="chatsSheet" role="dialog" aria-label="Group chats">
+        <div class="sheet-grab"></div>
+        <div class="chats-top">
+          <div class="sheet-title">Group chats</div>
+          <button class="round-mini" id="chatsRefresh" aria-label="Refresh chats">
+            <svg class="ic"><use href="#i-repeat"/></svg>
+          </button>
+        </div>
+        <p class="sheet-sub">One chat per group. When the bot joins a new group, that group gets its own chat here — nothing is shared between them.</p>
+        <div class="chat-rows" id="chatRows"></div>
+        <div class="sheet-rows">
+          <button class="sheet-row" id="chatClearRow">
+            <span class="lbl">Clear this chat<div class="hint">Deletes the mirrored history in the app · Telegram is untouched</div></span>
+            <svg class="ic"><use href="#i-trash"/></svg>
+          </button>
+        </div>
       </div>
 
       <div class="sheet" id="inviteSheet" role="dialog" aria-label="Invite and share">

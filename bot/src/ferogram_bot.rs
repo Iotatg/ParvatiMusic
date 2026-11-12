@@ -522,6 +522,9 @@ fn mirror_to_miniapp(m: &ferogram::update::IncomingMessage, msg: &TgMessage) {
     if !crate::webapp::tracks_chat(msg.chat_id) {
         return;
     }
+    // A new group gets its own chat row on the very first update (including
+    // textless service messages), not only once someone sends a real message.
+    crate::webapp::note_chat(msg.chat_id);
     crate::parv_info!(
         "mirror",
         "chat={} mid={} from={} out={} kind={} len={}",

@@ -91,6 +91,9 @@
   state.favorites = [];
   state.sleep = 0;
   state.settings = {};
+  /// Chat the viewer is looking at (one per group) and the switcher list.
+  state.chat = { id: '', title: 'chingu gang', members: 0, live: true };
+  state.chats = [];
   const BLANK_ME = { name: 'You', username: 'you', photo: '', level: 1, levelPct: 0, toNext: '0m', listening: '0m', songs: 0, liked: 0 };
   let online = false;
   let localPos = 0;
@@ -156,6 +159,18 @@
       if ('position' in next.playback) { localPos = next.playback.position; lastSync = performance.now(); }
     }
     if (next.members) state.members = next.members;
+    if (next.chat) state.chat = { ...state.chat, ...next.chat };
+    if (Array.isArray(next.chats)) {
+      // Delete permissions are resolved by /api/chats when the switcher opens.
+      // A cheaper state frame must not wipe them and make the buttons blink
+      // away while the sheet is open.
+      const known = new Map((state.chats || []).map(c => [String(c.id), c]));
+      state.chats = next.chats.map(c => {
+        const old = known.get(String(c.id));
+        return old && old.can_delete && !c.can_delete
+          ? { ...c, can_delete: true } : c;
+      });
+    }
     if (next.messages) {
       state.messages = next.messages;
       chatSig = sigOf(next.messages);
@@ -220,13 +235,19 @@
           const msg = JSON.parse(e.data);
           if (msg.type === 'state') { merge(msg.data); queueRender(); }
           else if (msg.type === 'messages') {
+            // A frame can arrive for the chat the viewer just left; applying it
+            // would paint another group's messages into this one.
+            if (msg.chat && state.chat.id && msg.chat !== state.chat.id) return;
             const sig = sigOf(msg.data);
             if (sig === chatSig) return;
             const grew = msg.data.length > state.messages.length;
             state.messages = msg.data;
             chatSig = sig;
             renderChat(true);
-            if (grew && activeTab !== 'chat') { unread += 1; paintUnread(); }
+            if (grew) {
+              if (activeTab !== 'chat') { unread += 1; paintUnread(); }
+              else markRead();
+            }
           }
         } catch {}
       };
@@ -318,6 +339,7 @@
     if (document.hidden) { renderDirty = true; return; }
     renderDirty = false;
     renderRoom();
+    renderChatHeader();
     renderSong(force);
     renderMembers(force);
     renderQueue(force);
@@ -344,8 +366,42 @@
     $('#roomName').textContent = state.room.title;
   }
 
+  /// Header of the chat tab: which group this chat belongs to, whether its
+  /// voice chat is live, and how many unread messages the *other* chats hold.
+  function renderChatHeader() {
+    const c = state.chat || {};
+    const name = c.title || state.room?.title || 'Chat';
+    const nameEl = $('#chatName');
+    if (nameEl) nameEl.textContent = name;
+    const dot = $('#csDot');
+    if (dot) dot.classList.toggle('is-on', !!c.live);
+    const list = state.chats || [];
+    const other = list.reduce((n, x) =>
+      n + (String(x.id) === String(c.id) ? 0 : Math.max(0, +x.unread || 0)), 0);
+    const badge = $('#chatBadge');
+    if (badge) {
+      badge.hidden = other <= 0;
+      badge.textContent = other > 99 ? '99+' : String(other);
+    }
+    const sw = $('#chatSwitch');
+    if (sw) sw.title = `${list.length || 1} chat${(list.length || 1) === 1 ? '' : 's'} · tap to switch`;
+    // Only an admin (or the owner) can clear a chat: hide the action rather
+    // than letting a member tap it and get a 403.
+    const clearRow = $('#chatClearRow');
+    if (clearRow) clearRow.style.display = c.can_clear ? '' : 'none';
+    // The sheet stays mounted; repaint it in place while it is open.
+    const sheet = $('#chatsSheet');
+    if (sheet && sheet.classList.contains('is-open')) renderChatRows();
+    paintUnread();
+  }
+
   /* ───────────────────── session (live / ended) ───────────────────── */
   const isLive = () => state.room?.live !== false;
+  /// Is the chat on screen the one that belongs to the playing room? Every
+  /// other group has its own chat, and those stay open (and unfiltered) no
+  /// matter what happens in this room's voice session.
+  const viewingLiveRoom = () => !state.chat?.id || String(state.chat.id) === String(state.room?.id);
+  const chatLive = () => (viewingLiveRoom() ? isLive() : true);
   const session = () => state.session || {};
 
   const fmtSpan = (sec) => {
@@ -403,11 +459,12 @@
     }
 
     const input = $('#chatInput');
-    if (input) input.dataset.ph = live ? 'Message the room…' : 'Voice chat ended — chat is cleared';
+    const open = chatLive();
+    if (input) input.dataset.ph = open ? 'Message the room…' : 'Voice chat ended — chat is cleared';
     // No posting into a group whose voice chat is over.
-    if (input) input.contentEditable = live ? 'true' : 'false';
+    if (input) input.contentEditable = open ? 'true' : 'false';
     const pill = document.querySelector('.composer-pill');
-    if (pill) pill.classList.toggle('is-locked', !live);
+    if (pill) pill.classList.toggle('is-locked', !open);
   }
 
   function currentTrack() { return state.playback.track; }
@@ -872,7 +929,7 @@
   /// filtering would hide everybody, so nothing is filtered.
   function visibleMessages() {
     const all = state.messages || [];
-    if (chatScope !== 'vc' || !isLive() || state.room.vc_known === false) return all;
+    if (chatScope !== 'vc' || !isLive() || !viewingLiveRoom() || state.room.vc_known === false) return all;
     const ids = vcIds();
     if (!ids.size) return all;
     return all.filter(m => m.mine || !m.from || m.from === 'bot'
@@ -882,7 +939,7 @@
   /// When "In voice" hides messages, say so instead of looking like the chat
   /// lost them — one tap brings the whole group chat back.
   function hiddenBanner() {
-    if (chatScope !== 'vc' || !isLive()) return '';
+    if (chatScope !== 'vc' || !isLive() || !viewingLiveRoom()) return '';
     const hidden = (state.messages || []).length - visibleMessages().length;
     if (hidden <= 0) return '';
     return `<div class="scope-hint" data-scope-all="1">
@@ -961,7 +1018,8 @@
 
   function renderChat(force = false) {
     const box = $('#msgs');
-    const list = visibleMessages();    const sig = `${list.length}|${sigOf(list)}|${chatScope}|${isLive() ? 1 : 0}|${vcIds().size}`;
+    const list = visibleMessages();
+    const sig = `${state.chat.id}|${list.length}|${sigOf(list)}|${chatScope}|${chatLive() ? 1 : 0}|${vcIds().size}`;
     if (!force && sig === lastSig.chat) return;
     lastSig.chat = sig;
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
@@ -1007,17 +1065,23 @@
 
     if (!state.messages.length) {
       const sm = session();
-      const ended = !isLive() && (sm.ended_at || 0) > 0;
+      const ended = !isLive() && viewingLiveRoom() && (sm.ended_at || 0) > 0;
+      const others = (state.chats || []).filter(c => String(c.id) !== String(state.chat.id)).length;
+      const otherLine = others
+        ? `<span style="display:block;margin-top:6px">${others} other group chat${others === 1 ? '' : 's'} · tap the group name above to switch</span>`
+        : '';
       box.innerHTML = ended
         ? `<div class="chat-empty">
              <div class="chat-empty-ic"><svg class="ic"><use href="#i-mic-off"/></svg></div>
              <b>Voice chat ended</b>
              <span>${esc(sm.ended_by ? `Ended by ${sm.ended_by}` : 'Everyone left the call')}${sm.ended_hm ? ` · ${esc(sm.ended_hm)}` : ''}<br/>Chat cleared${sm.tracks ? ` · ${sm.tracks} track${sm.tracks > 1 ? 's' : ''} played` : ''}</span>
+             ${otherLine}
            </div>`
         : `<div class="chat-empty">
              <div class="chat-empty-ic"><svg class="ic"><use href="#i-chat"/></svg></div>
              <b>No messages yet</b>
-             <span>Say something in the group and it shows up here.</span>
+             <span>${viewingLiveRoom() ? 'Say something in the group and it shows up here.' : `“${esc(state.chat.title || 'This group')}” has no messages yet.`}</span>
+             ${otherLine}
            </div>`;
       renderChat._first = true;
       return;
@@ -1057,7 +1121,170 @@
 
   function paintUnread() {
     const dot = $('#chatDot');
-    dot.classList.toggle('is-on', unread > 0 && activeTab !== 'chat');
+    // The header badge counts unread messages in the *other* group chats; the
+    // tab dot has to agree with it instead of counting only local SSE frames.
+    const other = (state.chats || []).reduce((n, x) =>
+      n + (String(x.id) === String(state.chat?.id) ? 0 : Math.max(0, +x.unread || 0)), 0);
+    dot.classList.toggle('is-on', (unread > 0 || other > 0) && activeTab !== 'chat');
+  }
+
+  /// Tell the server this viewer has seen the chat. Throttled: it fires on
+  /// every incoming message while the chat tab is open.
+  let readAt = 0;
+  function markRead() {
+    if (!online || !state.chat?.id) return;
+    const now = Date.now();
+    if (now - readAt < 1500) return;
+    readAt = now;
+    api('/api/chat/read', {}).catch(() => {});
+  }
+
+  /* ─────────────────── group chats (one per group) ─────────────────── */
+
+  /// Telegram's own confirmation sheet when it is there, a plain one otherwise.
+  function askConfirm(title, message, label = 'Delete') {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      try {
+        if (tg?.showPopup) {
+          tg.showPopup({
+            title,
+            message,
+            buttons: [
+              { id: 'cancel', type: 'cancel' },
+              { id: 'ok', type: 'destructive', text: label },
+            ],
+          }, (id) => finish(id === 'ok'));
+          return;
+        }
+      } catch {}
+      finish(window.confirm(`${title}\n\n${message}`));
+    });
+  }
+
+  function renderChatRows() {
+    const box = $('#chatRows');
+    if (!box) return;
+    const list = state.chats || [];
+    if (!list.length) {
+      box.innerHTML = '<div class="prof-none">No chats yet. As soon as the bot is in a group, its chat shows up here.</div>';
+      return;
+    }
+    box.innerHTML = list.map((c) => {
+      const on = String(c.id) === String(state.chat.id);
+      const unread = Math.max(0, +c.unread || 0);
+      const sub = c.last_text
+        ? `${c.last_ts ? `${c.last_ts} · ` : ''}${c.last_text}`
+        : (c.live ? 'Voice chat live · no messages yet' : 'No messages yet');
+      return `<div class="chat-row ${on ? 'is-on' : ''}" data-chat="${esc(c.id)}" role="button" tabindex="0">
+          <span class="cr-ic"><svg class="ic"><use href="#i-users"/></svg></span>
+          <span class="cr-body"><b>${esc(c.title || `Chat ${c.id}`)}</b><span>${esc(sub)}</span></span>
+          ${c.live ? '<span class="cr-live"></span>' : ''}
+          ${unread ? `<span class="cr-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+          ${c.can_delete ? `<button class="cr-del" data-del-chat="${esc(c.id)}" aria-label="Delete chat">
+            <svg class="ic"><use href="#i-trash"/></svg></button>` : ''}
+        </div>`;
+    }).join('');
+  }
+
+  async function openChats() {
+    haptic('light');
+    renderChatRows();
+    openSocial('#chatsSheet');
+    // Permissions ("can I delete this chat?") are only resolved on open, not on
+    // every state tick — that would mean a bridge call per chat per second.
+    await refreshChats(true);
+  }
+
+  async function refreshChats(silent = false) {
+    if (!online) return;
+    try {
+      const r = await api('/api/chats');
+      if (Array.isArray(r.chats)) state.chats = r.chats;
+      renderChatRows();
+      renderChatHeader();
+      if (!silent) toast(`${state.chats.length} chat${state.chats.length === 1 ? '' : 's'}`);
+    } catch (e) {
+      if (!silent) toast(`Could not refresh: ${e.message}`);
+    }
+  }
+
+  async function switchChat(id) {
+    id = String(id || '');
+    if (!id) return;
+    if (id === String(state.chat.id)) { closeSocial(); return; }
+    try {
+      await api('/api/chat/select', { id });
+      // Pull the new chat's own timeline; the SSE frame for it would arrive on
+      // the next tick anyway, but this makes the switch instant.
+      const s = await api('/api/state');
+      merge(s);
+      chatSig = sigOf(state.messages || []);
+      lastSig.chat = '';
+      closeSocial();
+      renderAll(true);
+      scrollChat();
+      toast(`Switched to ${state.chat.title || 'chat'}`);
+    } catch (e) {
+      toast(`Could not switch: ${e.message}`);
+    }
+  }
+
+  async function deleteChat(id) {
+    id = String(id || '');
+    if (!id) return;
+    const row = (state.chats || []).find(c => String(c.id) === id) || {};
+    const title = row.title || `Chat ${id}`;
+    const home = !!row.active;
+    const ok = await askConfirm(
+      home ? 'Clear this chat' : 'Delete chat',
+      home
+        ? `Delete every mirrored message of “${title}” in the app? The Telegram group itself is not touched.`
+        : `Remove “${title}” from the app? Its mirrored messages are deleted; the Telegram group is not touched.`,
+      home ? 'Clear' : 'Delete',
+    );
+    if (!ok) return;
+    try {
+      const r = await api('/api/chat/forget', { id });
+      if (Array.isArray(r.chats)) state.chats = r.chats;
+      if (String(state.chat.id) === id) {
+        // The chat being viewed was cleared or removed: reload the view.
+        const s = await api('/api/state');
+        merge(s);
+        chatSig = sigOf(state.messages || []);
+        lastSig.chat = '';
+        renderAll(true);
+      } else {
+        renderChatRows();
+        renderChatHeader();
+      }
+      toast(r.cleared ? 'Chat cleared' : 'Chat deleted');
+    } catch (e) {
+      toast(`Delete failed: ${e.message}`);
+    }
+  }
+
+  async function clearChatNow() {
+    const id = String(state.chat.id || '');
+    if (!id) return;
+    const ok = await askConfirm(
+      'Clear this chat',
+      `Delete every mirrored message of “${state.chat.title || 'this chat'}” in the app? The Telegram group itself is not touched.`,
+      'Clear',
+    );
+    if (!ok) return;
+    try {
+      await api('/api/chat/clear', {});
+      state.messages = [];
+      chatSig = '0';
+      lastSig.chat = '';
+      renderChat(true);
+      renderChatRows();
+      toast('Chat cleared');
+    } catch (e) {
+      toast(`Could not clear: ${e.message}`);
+    }
   }
 
   /* ────────────────────────── tabs ────────────────────────── */
@@ -1072,6 +1299,7 @@
     if (tab === 'chat') {
       unread = 0;
       paintUnread();
+      markRead();
       const box = $('#msgs');
       requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
     }
@@ -1176,7 +1404,7 @@
   }
 
   async function sendText() {
-    if (!isLive()) { toast('Voice chat ended — chat is cleared'); return; }
+    if (!chatLive()) { toast('Voice chat ended — chat is cleared'); return; }
     const { text, entities } = readComposer();
     if (!text.trim()) return;
     const reply = replyTarget;
@@ -1224,7 +1452,7 @@
   }
 
   async function sendSticker(s, thumb) {
-    if (!isLive()) { toast('Voice chat ended — chat is cleared'); return; }
+    if (!chatLive()) { toast('Voice chat ended — chat is cleared'); return; }
     // Use the sticker document itself, not its static thumbnail: the Bot API
     // proxy answers with WebP / WebM / gzip `.tgs`, and media_kind tells the
     // bubble which renderer to use.
@@ -1919,7 +2147,7 @@
   }
 
   /* ─────────────────── social: shared overlays ─────────────────── */
-  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet'];
+  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet'];
 
   function closeSocial() {
     SOCIAL_SHEETS.forEach(s => { const el = $(s); if (el) el.classList.remove('is-open'); });
@@ -2126,16 +2354,19 @@
   function openMsgMenu(m) {
     if (!m) return;
     social.msgMenu = m;
-    $('#actPreview').innerHTML = `<b>${esc(m.mine ? 'You' : (m.name || 'member'))}</b>${esc(msgPreview(m))}`;
+    const own = !!m.mine || String(m.from) === String(viewer?.id);
+    $('#actPreview').innerHTML = `<b>${esc(own ? 'You' : (m.name || 'member'))}</b>${esc(msgPreview(m))}`;
     const acts = [
       { k: 'reply', label: 'Reply', ic: '#i-reply' },
       { k: 'copy', label: 'Copy text', ic: '#i-copy', show: !!m.text },
       { k: 'forward', label: 'Forward', ic: '#i-forward' },
       { k: 'saveSticker', label: 'Add to Stickers', ic: '#i-bookmark', show: m.kind === 'sticker' },
-      { k: 'react', label: 'React ❤️', ic: '#i-heart' },
-      { k: 'profile', label: 'View profile', ic: '#i-user', show: !m.mine && !!m.from && m.from !== 'bot' },
+      { k: 'react', label: 'React ❤️', ic: '#i-heart', show: !!m.mid },
+      { k: 'profile', label: 'View profile', ic: '#i-user', show: !own && !!m.from && m.from !== 'bot' },
+      // Local-only bubbles (mid 0) never reached Telegram, so they are removed
+      // from the mirror only; the server handles both cases on the same route.
       { k: 'delete', label: 'Delete', ic: '#i-trash', danger: true,
-        show: !!m.mid && online && (m.mine || amAdmin()) },
+        show: online && (own || amAdmin()) && (!!m.mid || !!m.id) },
     ].filter(a => a.show !== false);
     $('#actGrid').innerHTML = acts.map(a => `
       <button class="act-btn ${a.danger ? 'danger' : ''}" data-msg-act="${a.k}">
@@ -2163,28 +2394,18 @@
   async function deleteMsg(m) {
     const run = async () => {
       try {
-        await api('/api/chat/delete', { mid: m.mid });
+        await api('/api/chat/delete', { mid: m.mid || 0, id: m.id });
         state.messages = state.messages.filter(x => String(x.id) !== String(m.id));
         chatSig = sigOf(state.messages);
         renderChat(true);
         toast('Message deleted');
       } catch (e) { toast(`Delete failed: ${e.message}`); }
     };
-    let asked = false;
-    try {
-      if (tg?.showPopup) {
-        tg.showPopup({
-          title: 'Delete message',
-          message: 'Delete this message in the group and the mirrored chat?',
-          buttons: [
-            { id: 'cancel', type: 'cancel' },
-            { id: 'ok', type: 'destructive', text: 'Delete' },
-          ],
-        }, (id) => { if (id === 'ok') run(); });
-        asked = true;
-      }
-    } catch {}
-    if (!asked) run();
+    const ok = await askConfirm(
+      'Delete message',
+      m.mid ? 'Delete this message in the group and the mirrored chat?' : 'Delete this message from the chat?',
+    );
+    if (ok) run();
   }
 
   /* ─────────────────── forward to a private chat ─────────────────── */
@@ -2673,6 +2894,15 @@
     });
 
     // ── chat scope + private chats
+    $('#chatSwitch').addEventListener('click', openChats);
+    $('#chatsRefresh').addEventListener('click', () => refreshChats());
+    $('#chatClearRow').addEventListener('click', clearChatNow);
+    $('#chatRows').addEventListener('click', (e) => {
+      const del = e.target.closest('[data-del-chat]');
+      if (del) { e.stopPropagation(); deleteChat(del.dataset.delChat); return; }
+      const row = e.target.closest('[data-chat]');
+      if (row) switchChat(row.dataset.chat);
+    });
     $('#chatSeg').addEventListener('click', (e) => {
       const b = e.target.closest('[data-scope]');
       if (!b) return;
