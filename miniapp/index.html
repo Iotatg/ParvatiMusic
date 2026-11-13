@@ -399,8 +399,24 @@
 
       <div class="sheet" id="settingsSheet" role="dialog" aria-label="Settings">
         <div class="sheet-grab"></div>
-        <div class="sheet-title">Room settings</div>
+        <div class="sheet-title">Settings</div>
+        <p class="sheet-sub">Preferences for this device and this room.</p>
         <div class="sheet-rows" id="settingsRows"></div>
+      </div>
+
+      <!-- "…" holds actions on the room/chat/group — never preferences. -->
+      <div class="sheet" id="moreSheet" role="dialog" aria-label="More actions">
+        <div class="sheet-grab"></div>
+        <div class="sheet-title">More</div>
+        <p class="sheet-sub" id="moreSub">Chat, group and voice-chat actions.</p>
+        <div class="sheet-rows" id="moreRows"></div>
+      </div>
+
+      <div class="sheet" id="bannedSheet" role="dialog" aria-label="Banned users">
+        <div class="sheet-grab"></div>
+        <div class="sheet-title">Banned users</div>
+        <p class="sheet-sub">Bans made through this app. Telegram's Bot API cannot list a group's full ban history, so bans created elsewhere are not shown here.</p>
+        <div class="sheet-rows" id="bannedRows"></div>
       </div>
 
       <!-- ───────────── group chats (one per group) ───────────── -->

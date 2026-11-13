@@ -1694,3 +1694,26 @@ html.app-hidden *{ animation-play-state:paused !important; }
 .auth-card h2{ font-size:16px; font-weight:600; margin:0 0 10px; color:#fff; }
 .auth-card p{ font-size:11.5px; line-height:1.6; color:rgba(255,255,255,.78); margin:0 0 8px; }
 .auth-card .auth-sub{ font-size:10px; color:rgba(255,255,255,.45); margin:0; }
+
+/* ── gear / "…" / banned sheets ── */
+button.sheet-row{ width:100%; text-align:left; }
+button.sheet-row:active{ background:rgba(255,255,255,.05); }
+.more-ic{
+  width:30px; height:30px; flex:0 0 auto; border-radius:9px;
+  display:grid; place-items:center;
+  background:rgba(255,255,255,.06); color:#c9c9cc;
+}
+.more-ic .ic{ width:15px; height:15px; }
+.danger-row .more-ic{ background:rgba(255,77,79,.12); color:#ff8f99; }
+.danger-row .lbl{ color:#ff8f99; }
+.banned-av{
+  width:30px; height:30px; flex:0 0 auto; border-radius:50%;
+  display:grid; place-items:center; font-size:11px; font-weight:600;
+  background:linear-gradient(135deg,#2f9bff,#7a4ddb); color:#fff;
+}
+.unban-btn{
+  height:26px; padding:0 12px; border-radius:999px; flex:0 0 auto;
+  background:rgba(47,155,255,.14); border:1px solid rgba(47,155,255,.32);
+  color:#8cc6ff; font-size:9.5px; font-weight:600;
+}
+.unban-btn:active{ background:rgba(47,155,255,.26); }

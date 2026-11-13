@@ -153,6 +153,11 @@ pub struct MiniApp {
     admin_cache: Mutex<HashMap<(i64, i64), (bool, u64)>>,
     /// `uid:chat` → newest message date that viewer has seen (unread badge).
     last_read: Mutex<HashMap<String, i64>>,
+    /// Bans performed through this app, per chat (`cache/banned-<chat>.json`).
+    /// The Bot API cannot enumerate a group's ban history, so this local list
+    /// is what the "Banned users" sheet shows and what "Unban" acts on.
+    banned: Mutex<HashMap<i64, Vec<Value>>>,
+    banned_loaded: Mutex<std::collections::HashSet<i64>>,
     /// Root of the JSON caches. Injectable so the per-chat tests never write
     /// into the live `cache/` directory.
     cache_dir: PathBuf,
@@ -518,6 +523,8 @@ pub fn install(rooms: Rooms) {
         view_chat: Mutex::new(HashMap::new()),
         admin_cache: Mutex::new(HashMap::new()),
         last_read: Mutex::new(HashMap::new()),
+        banned: Mutex::new(HashMap::new()),
+        banned_loaded: Mutex::new(std::collections::HashSet::new()),
         cache_dir: PathBuf::from("cache"),
         members: Mutex::new(Vec::new()),
         seen: Mutex::new(Vec::new()),
@@ -1396,7 +1403,7 @@ impl MiniApp {
         {
             return;
         }
-        self.load_chat(chat);
+        self.load_chat(chat, false);
     }
 
     fn chat_msgs(&self, chat: i64) -> Vec<Value> {
@@ -1521,6 +1528,125 @@ impl MiniApp {
         self.save_chats();
     }
 
+    /// Re-read one chat's mirror from disk and refresh its group metadata and
+    /// roster in the background. Used by "Refresh chat" in the "…" sheet.
+    fn refresh_chat(&self, chat: i64) {
+        // Mark loaded again up front: the replace below is the authoritative
+        // copy, so the next `ensure_chat` must not re-read the file and undo
+        // any message that arrived between the refresh and the next frame.
+        self.chats_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat);
+        self.load_chat(chat, true);
+        if let Some(hub) = crate::webapp::app() {
+            thread::spawn(move || {
+                hub.resolve_chat_meta(chat);
+                hub.refresh_roster();
+            });
+        }
+    }
+
+    /* ── bans made through this app ── */
+
+    fn banned_file(&self, chat: i64) -> PathBuf {
+        self.cache_dir.join(format!("banned-{chat}.json"))
+    }
+
+    fn ensure_banned(&self, chat: i64) {
+        let mut loaded = self.banned_loaded.lock().unwrap_or_else(|e| e.into_inner());
+        if !loaded.insert(chat) {
+            return;
+        }
+        drop(loaded);
+        let Ok(raw) = std::fs::read(self.banned_file(chat)) else {
+            return;
+        };
+        let Ok(list) = serde_json::from_slice::<Vec<Value>>(&raw) else {
+            return;
+        };
+        self.banned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat, list);
+    }
+
+    fn banned_list(&self, chat: i64) -> Vec<Value> {
+        self.ensure_banned(chat);
+        self.banned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chat)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn save_banned(&self, chat: i64) {
+        let list = self
+            .banned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chat)
+            .cloned()
+            .unwrap_or_default();
+        let path = self.banned_file(chat);
+        if list.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let Ok(body) = serde_json::to_vec(&list) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn ban_add(&self, chat: i64, id: &str, by: &str) {
+        if id.is_empty() {
+            return;
+        }
+        self.ensure_banned(chat);
+        let known = self.member_by_id(id);
+        let row = json!({
+            "id": id,
+            "name": known.as_ref().and_then(|m| m["name"].as_str()).unwrap_or(id),
+            "username": known.as_ref().and_then(|m| m["username"].as_str()).unwrap_or(""),
+            "by": by,
+            "at": now_secs(),
+            "hm": now_hm(),
+        });
+        {
+            let mut map = self.banned.lock().unwrap_or_else(|e| e.into_inner());
+            let q = map.entry(chat).or_default();
+            q.retain(|b| b["id"].as_str() != Some(id));
+            q.push(row);
+            if q.len() > 200 {
+                q.remove(0);
+            }
+        }
+        self.save_banned(chat);
+    }
+
+    fn ban_remove(&self, chat: i64, id: &str) -> bool {
+        self.ensure_banned(chat);
+        let removed = {
+            let mut map = self.banned.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(q) = map.get_mut(&chat) else {
+                return false;
+            };
+            let before = q.len();
+            q.retain(|b| b["id"].as_str() != Some(id));
+            q.len() != before
+        };
+        if removed {
+            self.save_banned(chat);
+        }
+        removed
+    }
+
     /* ── chat persistence ── */
 
     /// Where one mirrored chat is kept between restarts.
@@ -1553,15 +1679,27 @@ impl MiniApp {
     }
 
     /// Restore one mirrored chat (names, tags, stickers, text) from disk.
-    fn load_chat(&self, chat: i64) {
-        let Ok(raw) = std::fs::read(self.chat_file(chat)) else {
+    ///
+    /// `replace` makes the reload idempotent: "Refresh chat" calls this a
+    /// second time on a chat that is already in memory, so appending would
+    /// duplicate every bubble. When it is set and the mirror is gone or
+    /// unreadable, the in-memory copy is dropped too — disk is authoritative.
+    /// The first-touch path keeps the existing copy on a read failure so a
+    /// transient I/O error can never wipe a live chat.
+    fn load_chat(&self, chat: i64, replace: bool) {
+        let parsed = std::fs::read(self.chat_file(chat))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Vec<Value>>(&raw).ok());
+        let Some(list) = parsed else {
+            if replace {
+                self.chats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&chat);
+            }
             return;
         };
-        let Ok(list) = serde_json::from_slice::<Vec<Value>>(&raw) else {
-            return;
-        };
-        let mut map = self.chats.lock().unwrap_or_else(|e| e.into_inner());
-        let q = map.entry(chat).or_default();
+        let mut q = VecDeque::new();
         for m in list.into_iter().rev().take(CHAT_CAP).rev() {
             // Older builds mirrored Telegram service messages; they render as
             // empty bubbles, so drop them while restoring the cache.
@@ -1572,6 +1710,10 @@ impl MiniApp {
             }
             q.push_back(m);
         }
+        self.chats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat, q);
     }
 
     /* ── chat registry ── */
@@ -3531,6 +3673,23 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
         );
     }
 
+    // Bans recorded by this app for the chat the viewer is looking at. Only
+    // admins may see or change them; the Bot API cannot enumerate Telegram's
+    // own ban history, so this is deliberately scoped to app-made bans.
+    if req.method == "GET" && req.path == "/api/chat/banned" {
+        let target = app.chat_for(Some(auth));
+        if !app.is_owner(auth) && !app.is_admin_of(auth, target, true) {
+            return (403, json!({ "error": "not allowed" }));
+        }
+        return (
+            200,
+            json!({
+                "banned": app.banned_list(target),
+                "chat": target.to_string(),
+            }),
+        );
+    }
+
     if req.method != "POST" {
         return (404, json!({ "error": "not found" }));
     }
@@ -3894,6 +4053,79 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 None => return (503, json!({ "error": "telegram bridge offline" })),
             }
         }
+        "/api/chat/refresh" => {
+            // Re-read the on-disk mirror, then refresh names + roster in the
+            // background. The response carries a complete frame so the client
+            // can repaint once without waiting for the next SSE tick.
+            let target = app.chat_for(Some(auth));
+            app.refresh_chat(target);
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "chat": app.chat_head(target, Some(auth)),
+                    "chats": app.chat_list_warmed(Some(auth)),
+                    "messages": app.chat_msgs(target),
+                    "state": app.snapshot(true, Some(auth)),
+                }),
+            );
+        }
+        "/api/chat/unban" => {
+            let target = app.chat_for(Some(auth));
+            if !app.is_owner(auth) && !app.is_admin_of(auth, target, true) {
+                return (403, json!({ "error": "not allowed" }));
+            }
+            let id = body["id"].as_str().unwrap_or_default().to_string();
+            if id.is_empty() {
+                return (400, json!({ "error": "id" }));
+            }
+            match tg_post(
+                "/mod",
+                &json!({
+                    "chat_id": target.to_string(),
+                    "user_id": id,
+                    "action": "unban",
+                }),
+            ) {
+                Some((code, _)) if code == 200 => {
+                    app.ban_remove(target, &id);
+                    app.refresh_roster();
+                    return (
+                        200,
+                        json!({ "ok": true, "banned": app.banned_list(target) }),
+                    );
+                }
+                Some((_, res)) => {
+                    return (
+                        502,
+                        json!({ "error": res["error"].as_str().unwrap_or("unban failed") }),
+                    )
+                }
+                None => return (503, json!({ "error": "telegram bridge offline" })),
+            }
+        }
+        "/api/chat/leave" => {
+            let target = app.chat_for(Some(auth));
+            if !app.is_owner(auth) && !app.is_admin_of(auth, target, true) {
+                return (403, json!({ "error": "not allowed" }));
+            }
+            let left = matches!(
+                tg_post("/leave", &json!({ "chat_id": target.to_string() })),
+                Some((code, _)) if code == 200
+            );
+            // The configured home chat is only cleared (the switcher must keep
+            // the room the app is bound to); other groups are fully forgotten.
+            app.forget_chat(target);
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "left": left,
+                    "active": app.chat_for(Some(auth)).to_string(),
+                    "chats": app.chat_list(Some(auth)),
+                }),
+            );
+        }
         "/api/chat/clear" => {
             // Wipe the local mirror of one chat. Telegram is untouched: this is
             // the "clear this chat in the app" action, useful when a room is
@@ -4008,13 +4240,25 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             if id.is_empty() {
                 return (400, json!({ "error": "id" }));
             }
+            // Promote/kick/ban are group-admin powers. Previously any viewer
+            // could call the bridge with them; Telegram would usually refuse,
+            // but the request itself was never authorised here.
+            let target = app.chat_for(Some(auth));
+            if !app.is_owner(auth) && !app.is_admin_of(auth, target, true) {
+                return (403, json!({ "error": "not allowed" }));
+            }
             let req_body = json!({
-                "chat_id": app.active_chat().to_string(),
+                "chat_id": target.to_string(),
                 "user_id": id,
                 "action": action,
             });
             match tg_post("/mod", &req_body) {
                 Some((code, res)) if code == 200 => {
+                    if action == "ban" {
+                        app.ban_add(target, &id, &auth.display_name("admin".to_string()));
+                    } else if action == "unban" || action == "kick" {
+                        app.ban_remove(target, &id);
+                    }
                     app.refresh_roster();
                     return (200, json!({ "ok": true, "result": res }));
                 }
@@ -4025,6 +4269,10 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             }
         }
         "/api/session/end" => {
+            let target = app.chat_for(Some(auth));
+            if !app.is_owner(auth) && !app.is_admin_of(auth, target, true) {
+                return (403, json!({ "error": "not allowed" }));
+            }
             let by = auth.display_name(body["name"].as_str().unwrap_or("mini app").to_string());
             let id: i64 = match auth.user_id {
                 Some(id) => id,
@@ -4034,7 +4282,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     .or_else(|| body["id"].as_i64())
                     .unwrap_or(0),
             };
-            if !end_session(app.active_chat(), id, &by, "app") {
+            if !end_session(target, id, &by, "app") {
                 return (404, json!({ "error": "no active voice chat" }));
             }
             return (200, json!({ "ok": true, "session": app.session_json(false) }));
@@ -4462,6 +4710,8 @@ mod chat_tests {
             view_chat: Mutex::new(HashMap::new()),
             admin_cache: Mutex::new(HashMap::new()),
             last_read: Mutex::new(HashMap::new()),
+            banned: Mutex::new(HashMap::new()),
+            banned_loaded: Mutex::new(std::collections::HashSet::new()),
             cache_dir,
             members: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
@@ -4710,6 +4960,39 @@ mod chat_tests {
         assert!(
             app.chat_msgs(OTHER).is_empty(),
             "a textless service update must not create a message"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refresh_chat_is_idempotent_and_keeps_disk_authoritative() {
+        let (app, dir) = app();
+        app.push_message(HOME, msg(1, "11", "one", 10));
+        app.push_message(HOME, msg(2, "11", "two", 20));
+        app.push_message(HOME, msg(3, "11", "three", 30));
+        assert_eq!(app.chat_msgs(HOME).len(), 3);
+
+        // "Refresh chat" re-reads the on-disk mirror. An append-based reload
+        // used to duplicate every bubble each time the button was pressed.
+        app.refresh_chat(HOME);
+        app.refresh_chat(HOME);
+        let after = app.chat_msgs(HOME);
+        assert_eq!(after.len(), 3, "refresh must not duplicate messages");
+        assert_eq!(after[0]["text"], "one");
+        assert_eq!(after[2]["text"], "three");
+
+        // The loaded flag survives a refresh, so a message arriving right
+        // afterwards is not undone by a later ensure_chat() re-read.
+        app.push_message(HOME, msg(4, "11", "four", 40));
+        assert_eq!(app.chat_msgs(HOME).len(), 4, "new messages survive refresh");
+
+        // When the mirror is gone, refresh drops the in-memory copy: disk is
+        // authoritative, so a stale bubble must not be resurrected.
+        let _ = std::fs::remove_file(app.chat_file(HOME));
+        app.refresh_chat(HOME);
+        assert!(
+            app.chat_msgs(HOME).is_empty(),
+            "a missing mirror must clear the in-memory copy"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

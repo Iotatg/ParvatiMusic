@@ -628,6 +628,20 @@ def r_delete(body: dict) -> tuple[int, dict]:
     return 200, {"ok": True}
 
 
+def r_leave(body: dict) -> tuple[int, dict]:
+    """Bot leaves a group. Called only after the Mini App checked admin rights."""
+    cid = body.get("chat_id")
+    if not cid:
+        return 400, {"error": "chat_id"}
+    res = api("leaveChat", chat_id=cid)
+    if not res.get("ok"):
+        return 502, {"error": res.get("description", "leave failed")}
+    for k in list(_json_cache):
+        if k.startswith("admins:") or k.startswith("chat:") or k.startswith("member:"):
+            _json_cache.pop(k, None)
+    return 200, {"ok": True}
+
+
 # ───────────────────────────── http plumbing ─────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -720,6 +734,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, out = r_mod(body)
             elif u.path == "/delete":
                 code, out = r_delete(body)
+            elif u.path == "/leave":
+                code, out = r_leave(body)
             else:
                 code, out = 404, {"error": "not found"}
         except Exception as e:

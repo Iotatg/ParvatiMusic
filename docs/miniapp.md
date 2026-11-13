@@ -481,6 +481,10 @@ sync with what happens in Telegram.
 * Group messages, chat metadata and switcher state are all keyed by chat id.
   There is no global message queue left to leak one group's history into
   another viewer's session.
+* Group-admin powers (`/api/members` promote/kick/ban, `/api/session/end`,
+  `/api/chat/leave`, `/api/chat/unban`, `GET /api/chat/banned`) are re-checked
+  server-side against the verified id and the target chat. A non-admin gets
+  `403` before the request ever reaches the Telegram bridge.
 
 ## Reverse proxy (Caddy)
 
@@ -667,6 +671,49 @@ expensive thing on the page. Three things keep it smooth:
 The blur radii on the dock, tab bar and context menu were also reduced
 (26px → 14px), because they sit above scrolling lists and are re-blurred on
 every frame of that scroll.
+
+### Playback must never be interrupted by a repaint
+
+Audio/video streams into a single `<audio>` / `<video>` element that survives
+renders. Three guards keep it from stuttering:
+
+* **No page reloads.** "Clear media cache" busts same-origin image URLs in
+  place; the old implementation called `location.replace()`, which tore down
+  the media element and restarted the stream mid-song.
+* **Smooth playhead.** `merge()` ignores the server's 1 Hz `position` unless
+  the track changed, it is the first frame, or the drift exceeds 4 s. The
+  local 250 ms ticker interpolates between drift corrections.
+* **Seek cooldown.** `syncAudio()` / `syncVideo()` only correct a >3 s drift,
+  only when `readyState >= 2`, and at most once every 5 s. A seek forces a new
+  HTTP Range request, so doing it on every tick used to re-buffer constantly.
+* **One event stream.** A single guarded `EventSource` with exponential
+  backoff; `/api/state` polling runs only while SSE is down. Returning to the
+  foreground uses `queueRender()` instead of a full `renderAll()`.
+
+## Gear vs "…" menus
+
+The gear holds **preferences only**; the "…" sheet holds **actions**. They used
+to open the same sheet, which mixed toggles with destructive operations.
+
+| Gear (settings) | "…" (more) |
+| --- | --- |
+| Autoplay, Loop queue, Haptics, Now playing alerts | Group chats (switcher) |
+| Lite mode (device-local) | Refresh chat, Clear chat |
+| Clear media cache | Banned users (+ Unban) |
+| Open bot in Telegram | Invite & share, End voice chat, Leave group |
+
+| Action | Path | Notes |
+| --- | --- | --- |
+| Refresh chat | `POST /api/chat/refresh` | Re-reads `cache/mirror-<chat>.json`, refreshes group title and roster in the background, returns a complete state frame. The reload is a **replace**, not an append, so pressing it twice never duplicates bubbles; a missing/corrupt mirror clears the in-memory copy (disk is authoritative). |
+| Banned users | `GET /api/chat/banned` | Admin only. `cache/banned-<chat>.json` holds bans made through this app; the Bot API cannot enumerate a group's full ban history. |
+| Unban | `POST /api/chat/unban` | Admin only. Calls the bridge `/mod` with `action=unban`, then removes the local record. |
+| Leave group | `POST /api/chat/leave` | Admin only. Bridge `/leave` → `leaveChat`; the home chat is cleared, other groups are forgotten locally. Requires a confirmation popup in the client. |
+| Clear chat | `POST /api/chat/clear` | Admin only. Local mirror only; Telegram history is untouched. |
+| End voice chat | `POST /api/session/end` | Admin only. Stops the stream and leaves the call. |
+
+`GET /api/chats` and `GET /api/chat/banned` are handled in the GET branch
+*before* the POST-only router — a GET that falls through there returns 404 and
+the sheet silently loses its permissions.
 
 ## Troubleshooting
 

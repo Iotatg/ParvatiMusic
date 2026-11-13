@@ -98,6 +98,13 @@
   let online = false;
   let localPos = 0;
   let lastSync = 0;
+  /// Track the playhead was last hard-aligned to. A state frame arrives every
+  /// few seconds with the server's position; blindly copying it used to yank
+  /// the playhead back and make <audio>/<video> re-buffer (the "atak atak"
+  /// stutter). Only a track change or a real drift is allowed to re-align.
+  let posTrackId = '';
+  /// Do not let a seek be followed by another seek a frame later.
+  let seekGuardUntil = 0;
   let dragging = false;
   let activeTab = 'song';
   let replyTarget = null;
@@ -119,6 +126,7 @@
     sticker: null,
     forward: null,
     savedStickers: [],
+    banned: [],
   };
   /// 'vc' = only people currently in the voice chat (the room's own chat),
   /// 'all' = every mirrored group message.
@@ -156,7 +164,19 @@
     if (next.me) state.me = { ...BLANK_ME, ...next.me };
     if (next.playback) {
       Object.assign(state.playback, next.playback);
-      if ('position' in next.playback) { localPos = next.playback.position; lastSync = performance.now(); }
+      if ('position' in next.playback) {
+        const server = Number(next.playback.position) || 0;
+        const trackId = String(state.playback.track?.id || '');
+        // Ignore the routine drift frames: the local ticker is smoother than
+        // a 1 Hz integer from the server. Re-align only for a new track, the
+        // very first frame, or a genuine >4 s drift (e.g. after a reconnect).
+        if (!lastSync || trackId !== posTrackId || Math.abs(server - localPos) > 4) {
+          localPos = server;
+          lastSync = performance.now();
+          posTrackId = trackId;
+          seekGuardUntil = 0;
+        }
+      }
     }
     if (next.members) state.members = next.members;
     if (next.chat) state.chat = { ...state.chat, ...next.chat };
@@ -227,32 +247,56 @@
     document.body.appendChild(el);
   }
 
+  /// One live EventSource at a time. An unconditional reconnect on every error
+  /// used to stack several streams, each one pushing a full state frame and
+  /// forcing a repaint — that is what looked like the page refreshing.
+  let esCurrent = null;
+  let esRetry = 0;
+  let esTimer = 0;
+  let sseLive = false;
+
   function connectEvents() {
-    try {
-      const es = new EventSource(withAuth('/api/events'));
-      es.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === 'state') { merge(msg.data); queueRender(); }
-          else if (msg.type === 'messages') {
-            // A frame can arrive for the chat the viewer just left; applying it
-            // would paint another group's messages into this one.
-            if (msg.chat && state.chat.id && msg.chat !== state.chat.id) return;
-            const sig = sigOf(msg.data);
-            if (sig === chatSig) return;
-            const grew = msg.data.length > state.messages.length;
-            state.messages = msg.data;
-            chatSig = sig;
-            renderChat(true);
-            if (grew) {
-              if (activeTab !== 'chat') { unread += 1; paintUnread(); }
-              else markRead();
-            }
+    if (esCurrent) { try { esCurrent.close(); } catch {} esCurrent = null; }
+    let es;
+    try { es = new EventSource(withAuth('/api/events')); }
+    catch { scheduleEvents(); return; }
+    esCurrent = es;
+    es.onopen = () => { sseLive = true; esRetry = 0; };
+    es.onmessage = (e) => {
+      sseLive = true;
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'state') { merge(msg.data); queueRender(); }
+        else if (msg.type === 'messages') {
+          // A frame can arrive for the chat the viewer just left; applying it
+          // would paint another group's messages into this one.
+          if (msg.chat && state.chat.id && msg.chat !== state.chat.id) return;
+          const sig = sigOf(msg.data);
+          if (sig === chatSig) return;
+          const grew = msg.data.length > state.messages.length;
+          state.messages = msg.data;
+          chatSig = sig;
+          renderChat(true);
+          if (grew) {
+            if (activeTab !== 'chat') { unread += 1; paintUnread(); }
+            else markRead();
           }
-        } catch {}
-      };
-      es.onerror = () => { es.close(); setTimeout(connectEvents, 3000); };
-    } catch {}
+        }
+      } catch {}
+    };
+    es.onerror = () => {
+      sseLive = false;
+      try { es.close(); } catch {}
+      if (esCurrent === es) esCurrent = null;
+      scheduleEvents();
+    };
+  }
+
+  function scheduleEvents() {
+    clearTimeout(esTimer);
+    const wait = [3000, 6000, 10000][Math.min(esRetry, 2)];
+    esRetry += 1;
+    esTimer = setTimeout(connectEvents, wait);
   }
 
   /* ────────────────────────── utils ────────────────────────── */
@@ -523,6 +567,7 @@
   /// sound, so the element stays muted (no echo) and follows the room clock.
   let videoBound = '';
   let videoRetry = 0;
+  let videoPlayPending = false;
   function paintVideo(shown) {
     const v = $('#artVideo');
     if (!v) return;
@@ -569,19 +614,25 @@
     syncVideo();
   }
 
-  /// Nudge the element back onto the room's position. A 1.5 s window keeps
-  /// this from fighting the decoder every tick.
+  /// Nudge the element back onto the room's position. This runs on every
+  /// 250 ms progress tick, so a seek here used to interrupt the decoder four
+  /// times a second. Allow at most one correction every 5 s, only when the
+  /// drift is real and the element actually has data to seek into.
   function syncVideo() {
     const v = $('#artVideo');
     if (!v || !v.classList.contains('is-on') || !videoBound) return;
     const want = localPos;
-    if (Math.abs((v.currentTime || 0) - want) > 1.5) {
+    const now = performance.now();
+    if (v.readyState >= 2 && now > seekGuardUntil
+        && Math.abs((v.currentTime || 0) - want) > 3) {
       try { v.currentTime = want; } catch {}
+      seekGuardUntil = now + 5000;
     }
     if (state.playback.paused) {
       if (!v.paused) { try { v.pause(); } catch {} }
-    } else if (v.paused) {
-      v.play?.().catch(() => {});
+    } else if (v.paused && !videoPlayPending) {
+      videoPlayPending = true;
+      Promise.resolve(v.play?.()).catch(() => {}).finally(() => { videoPlayPending = false; });
     }
   }
 
@@ -590,6 +641,7 @@
   /// already playing it — two copies would echo), and unmuted otherwise.
   let audioBound = '';
   let audioRetry = 0;
+  let audioPlayPending = false;
   function paintAudio(shown) {
     const a = $('#artAudio');
     if (!a) return;
@@ -634,13 +686,20 @@
     const a = $('#artAudio');
     if (!a || !audioBound) return;
     const want = localPos;
-    if (Math.abs((a.currentTime || 0) - want) > 1.5) {
+    const now = performance.now();
+    // A seek tears down the buffered stream and forces a fresh Range request.
+    // Keep the media clock authoritative once it is running; only correct a
+    // large drift, and never twice inside the cooldown.
+    if (a.readyState >= 2 && now > seekGuardUntil
+        && Math.abs((a.currentTime || 0) - want) > 3) {
       try { a.currentTime = want; } catch {}
+      seekGuardUntil = now + 5000;
     }
     if (state.playback.paused) {
       if (!a.paused) { try { a.pause(); } catch {} }
-    } else if (a.paused) {
-      a.play?.().catch(() => {});
+    } else if (a.paused && !audioPlayPending) {
+      audioPlayPending = true;
+      Promise.resolve(a.play?.()).catch(() => {}).finally(() => { audioPlayPending = false; });
     }
   }
 
@@ -2070,12 +2129,17 @@
   }
 
   /* ────────────────────────── settings ────────────────────────── */
+  /// The gear holds *preferences only*. Everything that acts on the room,
+  /// the chat or the group lives in the "…" sheet (see renderMore).
   const SETTINGS = [
     { key: 'autoplay', label: 'Autoplay', hint: 'Keep playing similar songs', on: true },
     { key: 'loop', label: 'Loop queue', hint: 'Restart when the queue ends', on: false },
     { key: 'haptics', label: 'Haptics', hint: 'Vibrate on controls', on: true },
     { key: 'notify', label: 'Now playing alerts', hint: 'Post a card in the chat', on: true },
   ];
+
+  const canManage = () =>
+    !!(state.chat?.can_clear || amAdmin() || state.me?.role === 'owner');
 
   function renderSettings() {
     const toggles = SETTINGS.map(s => {
@@ -2089,33 +2153,115 @@
         <button class="switch ${on ? 'is-on' : ''}" data-setting="${s.key}" aria-label="${s.label}"></button>
       </div>`;
     }).join('');
-    // Ending the call is a real action (stops the stream, leaves the group
-    // call, clears the chat), so it sits at the bottom, in red, only while
-    // there is something to end.
-    const invite = `<div class="sheet-row" data-invite-room="1">
-        <span class="invite-row-ic"><svg class="ic"><use href="#i-plane"/></svg></span>
+    const lite = document.documentElement.classList.contains('fx-lite');
+    const local = `
+      <div class="sheet-row" data-set-act="lite" role="button" tabindex="0">
         <div style="flex:1">
-          <div class="lbl">Invite &amp; share</div>
-          <div class="hint">Send the room link with the bot username</div>
+          <div class="lbl">Lite mode</div>
+          <div class="hint">Solid panels instead of blur · smoother on older phones</div>
         </div>
-        <svg class="ic" style="width:12px;height:12px;color:#55565c"><use href="#i-chevron"/></svg>
-      </div>`;
-    const end = isLive()
-      ? `<div class="sheet-row danger-row">
-           <div style="flex:1">
-             <div class="lbl">End voice chat</div>
-             <div class="hint">Stops playback, leaves the call and clears the chat</div>
-           </div>
-           <button class="end-btn" id="btnEndSession">End</button>
-         </div>`
-      : `<div class="sheet-row">
-           <div style="flex:1">
-             <div class="lbl">Voice chat</div>
-             <div class="hint">No active session — send /play in the group</div>
-           </div>
-           <span class="tag member">ended</span>
-         </div>`;
-    $('#settingsRows').innerHTML = invite + toggles + end;
+        <button class="switch ${lite ? 'is-on' : ''}" aria-label="Lite mode"></button>
+      </div>
+      <button class="sheet-row" data-set-act="cache">
+        <span class="lbl">Clear media cache<div class="hint">Frees stickers, covers and avatars on this device</div></span>
+        <svg class="ic" style="width:14px;height:14px;color:#55565c"><use href="#i-trash"/></svg>
+      </button>
+      <button class="sheet-row" data-set-act="bot">
+        <span class="lbl">Open bot in Telegram<div class="hint">Commands, help and support</div></span>
+        <svg class="ic" style="width:14px;height:14px;color:#55565c"><use href="#i-external"/></svg>
+      </button>`;
+    $('#settingsRows').innerHTML = toggles + local;
+  }
+
+  const moreRow = (act, label, hint, icon, danger = false) => `
+    <button class="sheet-row ${danger ? 'danger-row' : ''}" data-more="${act}">
+      <span class="more-ic"><svg class="ic"><use href="#${icon}"/></svg></span>
+      <span class="lbl">${label}<div class="hint">${hint}</div></span>
+      <svg class="ic" style="width:12px;height:12px;color:#55565c"><use href="#i-chevron"/></svg>
+    </button>`;
+
+  function renderMore() {
+    const rows = [
+      moreRow('chats', 'Group chats', 'Switch between the per-group chats', 'i-chat'),
+      moreRow('refresh', 'Refresh chat', 'Re-sync messages, names and unread badges', 'i-repeat'),
+      canManage() ? moreRow('clear', 'Clear chat', 'Delete mirrored messages in the app', 'i-trash') : '',
+      canManage() ? moreRow('banned', 'Banned users', 'Review bans made through this app', 'i-ban') : '',
+      moreRow('invite', 'Invite & share', 'Send the room link with the bot username', 'i-plane'),
+      isLive()
+        ? moreRow('end', 'End voice chat', 'Stop playback and leave the call', 'i-x', true)
+        : `<div class="sheet-row"><span class="lbl">Voice chat<div class="hint">No active session — send /play in the group</div></span><span class="tag member">ended</span></div>`,
+      canManage() ? moreRow('leave', 'Leave group', 'Bot leaves this group · its chat is removed here', 'i-external', true) : '',
+    ].join('');
+    $('#moreRows').innerHTML = rows;
+  }
+
+  function renderBanned() {
+    const list = social.banned || [];
+    $('#bannedRows').innerHTML = list.length
+      ? list.map(b => `
+        <div class="sheet-row banned-row">
+          <span class="banned-av">${esc(String(b.name || b.id || '?').slice(0, 1).toUpperCase())}</span>
+          <span class="lbl">${esc(b.name || b.id)}
+            <div class="hint">${b.username ? '@' + esc(b.username) + ' · ' : ''}${esc(b.by || 'app')} · ${esc(b.hm || '')}</div>
+          </span>
+          <button class="unban-btn" data-unban="${esc(b.id)}">Unban</button>
+        </div>`).join('')
+      : `<div class="sheet-row"><span class="lbl">No bans recorded<div class="hint">Bans made through this app appear here</div></span></div>`;
+  }
+
+  async function openBanned() {
+    if (!online) { toast('Offline'); return; }
+    try {
+      const r = await api('/api/chat/banned');
+      social.banned = Array.isArray(r.banned) ? r.banned : [];
+      renderBanned();
+      openSocial('#bannedSheet');
+    } catch (e) {
+      toast(`Could not load bans: ${e.message}`);
+    }
+  }
+
+  async function refreshChatNow() {
+    if (!online) { toast('Offline'); return; }
+    toast('Refreshing chat…');
+    try {
+      const r = await api('/api/chat/refresh', {});
+      if (Array.isArray(r.messages)) { state.messages = r.messages; chatSig = sigOf(r.messages); }
+      if (Array.isArray(r.chats)) state.chats = r.chats;
+      if (r.chat) state.chat = { ...state.chat, ...r.chat };
+      if (r.state) merge(r.state);
+      lastSig.chat = '';
+      closeSheet();
+      renderAll(true);
+      renderChatRows();
+      toast('Chat refreshed');
+    } catch (e) {
+      toast(`Refresh failed: ${e.message}`);
+    }
+  }
+
+  async function leaveGroupNow() {
+    if (!online) { toast('Offline'); return; }
+    const ok = await askConfirm(
+      'Leave group?',
+      `The bot will leave “${state.chat.title || 'this group'}” and its mirrored chat will be removed from the app. This cannot be undone here.`,
+      'Leave',
+    );
+    if (!ok) return;
+    try {
+      const r = await api('/api/chat/leave', {});
+      if (Array.isArray(r.chats)) state.chats = r.chats;
+      closeSheet();
+      const s = await api('/api/state');
+      merge(s);
+      chatSig = sigOf(state.messages || []);
+      lastSig.chat = '';
+      renderAll(true);
+      renderChatRows();
+      toast(r.left ? 'Left the group' : 'Chat removed from the app');
+    } catch (e) {
+      toast(`Leave failed: ${e.message}`);
+    }
   }
 
   async function endVoiceChat() {
@@ -2135,19 +2281,28 @@
     }
   }
 
-  function openSheet() {
-    // Re-render first: the end-session row depends on the live state.
+  /// Gear -> preferences, "..." -> actions. They share one scrim but never
+  /// show at the same time; opening one closes the other.
+  function openSettings() {
+    $('#moreSheet').classList.remove('is-open');
     renderSettings();
     $('#settingsSheet').classList.add('is-open');
     $('#scrim').classList.add('is-on');
   }
+  function openMore() {
+    $('#settingsSheet').classList.remove('is-open');
+    renderMore();
+    $('#moreSheet').classList.add('is-open');
+    $('#scrim').classList.add('is-on');
+  }
   function closeSheet() {
     $('#settingsSheet').classList.remove('is-open');
+    $('#moreSheet').classList.remove('is-open');
     $('#scrim').classList.remove('is-on');
   }
 
   /* ─────────────────── social: shared overlays ─────────────────── */
-  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet'];
+  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet', '#bannedSheet'];
 
   function closeSocial() {
     SOCIAL_SHEETS.forEach(s => { const el = $(s); if (el) el.classList.remove('is-open'); });
@@ -2705,13 +2860,21 @@
         localStorage.removeItem('pm-covers');
         localStorage.removeItem('pm-searches');
       } catch {}
-      // Drop HTTP-cached stickers/avatars by reloading with a fresh query.
-      toast('Cache cleared · reloading');
-      setTimeout(() => {
-        const u = new URL(location.href);
-        u.searchParams.set('r', String(Date.now() % 100000));
-        location.replace(u.toString());
-      }, 500);
+      // Never reload the page to clear a cache: that tears down <audio>/<video>
+      // and restarts the stream mid-song. Bust only same-origin image URLs in
+      // place, so playback keeps running untouched.
+      const bust = String(Date.now());
+      $$('#app img[src]').forEach(img => {
+        const raw = img.getAttribute('src');
+        if (!raw || raw.startsWith('data:')) return;
+        try {
+          const u = new URL(raw, location.href);
+          if (u.origin !== location.origin) return;
+          u.searchParams.set('_cc', bust);
+          img.src = u.toString();
+        } catch {}
+      });
+      toast('Media cache cleared');
     };
     $('#btnClearCache').addEventListener('click', clearCache);
     $('#btnClearCache').addEventListener('keydown', (e) => {
@@ -2987,20 +3150,53 @@
       try { await api('/api/queue/clear', {}); } catch {}
     });
 
-    // ── settings
-    $('#btnSettings').addEventListener('click', openSheet);
-    $('#btnMore').addEventListener('click', openSheet);
+    // ── settings (gear) / more (…)
+    $('#btnSettings').addEventListener('click', () => { haptic('light'); openSettings(); });
+    $('#btnMore').addEventListener('click', () => { haptic('light'); openMore(); });
     $('#settingsRows').addEventListener('click', (e) => {
-      if (e.target.closest('[data-invite-room]')) { closeSheet(); openInvite(); return; }
-      if (e.target.closest('#btnEndSession')) { endVoiceChat(); return; }
       const sw = e.target.closest('[data-setting]');
-      if (!sw) return;
-      sw.classList.toggle('is-on');
-      const s = SETTINGS.find(x => x.key === sw.dataset.setting);
-      if (s) s.on = sw.classList.contains('is-on');
-      if (s) state.settings[s.key] = s.on;
+      if (sw) {
+        sw.classList.toggle('is-on');
+        const s = SETTINGS.find(x => x.key === sw.dataset.setting);
+        if (s) s.on = sw.classList.contains('is-on');
+        if (s) state.settings[s.key] = s.on;
+        haptic('light');
+        api('/api/settings', { [sw.dataset.setting]: s.on }).then(r => { if (r) merge(r); }).catch(() => {});
+        return;
+      }
+      const row = e.target.closest('[data-set-act]');
+      if (!row) return;
+      const act = row.dataset.setAct;
       haptic('light');
-      api('/api/settings', { [sw.dataset.setting]: s.on }).then(r => { if (r) merge(r); }).catch(() => {});
+      // Reuse the profile-tab controls so there is one implementation each.
+      if (act === 'lite') { $('#liteToggle').click(); renderSettings(); }
+      else if (act === 'cache') { $('#btnClearCache').click(); closeSheet(); }
+      else if (act === 'bot') { $('#btnOpenBot').click(); closeSheet(); }
+    });
+    $('#moreRows').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-more]');
+      if (!b) return;
+      haptic('light');
+      const act = b.dataset.more;
+      if (act === 'chats') { closeSheet(); openChats(); }
+      else if (act === 'refresh') refreshChatNow();
+      else if (act === 'clear') { closeSheet(); clearChatNow(); }
+      else if (act === 'banned') { closeSheet(); openBanned(); }
+      else if (act === 'invite') { closeSheet(); openInvite(); }
+      else if (act === 'end') endVoiceChat();
+      else if (act === 'leave') leaveGroupNow();
+    });
+    $('#bannedRows').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-unban]');
+      if (!b) return;
+      try {
+        const r = await api('/api/chat/unban', { id: b.dataset.unban });
+        if (Array.isArray(r.banned)) social.banned = r.banned;
+        renderBanned();
+        toast('User unbanned');
+      } catch (err) {
+        toast(`Unban failed: ${err.message}`);
+      }
     });
 
     // mini player -> song tab
@@ -3040,7 +3236,13 @@
   bind();
   boot();
   setInterval(tick, 250);
-  setInterval(() => { if (online) api('/api/state').then(merge).then(() => queueRender()).catch(() => {}); }, 8000);
+  // SSE is the live channel. Polling /api/state on top of it doubled every
+  // frame and re-aligned the playhead every 8 s; only use it as a fallback
+  // while the event stream is down or has not connected yet.
+  setInterval(() => {
+    if (!online || sseLive) return;
+    api('/api/state').then(merge).then(() => queueRender()).catch(() => {});
+  }, 8000);
 
   // Background tabs: pause CSS animations and stop painting; on return do one
   // catch-up render and refresh state, so nothing looks stale.
@@ -3048,8 +3250,8 @@
     const hidden = document.hidden;
     document.documentElement.classList.toggle('app-hidden', hidden);
     if (!hidden) {
-      if (renderDirty) renderAll();
-      if (online) api('/api/state').then(merge).then(() => renderAll()).catch(() => {});
+      if (renderDirty) queueRender();
+      if (online && !sseLive) api('/api/state').then(merge).then(() => queueRender()).catch(() => {});
     }
   });
 })();
