@@ -1513,7 +1513,11 @@ html.app-hidden *{ animation-play-state:paused !important; }
 .msg .bubble.sticker img, .msg .bubble.media img, .msg .msg-av{ pointer-events:auto; }
 
 /* ── swipe-to-reply: the row slides right, a reply arrow is revealed ── */
-.msg.is-swiping{ transition:none; z-index:2; }
+/* will-change promotes the sliding row to its own compositor layer, so the
+   transform moves at 60 fps instead of triggering a layout on every frame.
+   Paint containment is deliberately NOT used: it would clip the swipe hint
+   (left:-2px) and fight the content-visibility:auto already on .msg. */
+.msg.is-swiping{ transition:none; z-index:2; will-change:transform; }
 .msg.is-settling{ transition:transform .26s var(--ease); }
 .swipe-hint{
   position:absolute; left:-2px; top:50%; width:30px; height:30px;
@@ -1717,3 +1721,330 @@ button.sheet-row:active{ background:rgba(255,255,255,.05); }
   color:#8cc6ff; font-size:9.5px; font-weight:600;
 }
 .unban-btn:active{ background:rgba(47,155,255,.26); }
+
+/* ============================================================
+   POLISH LAYER — smooth motion, tap feedback, exit, micro-details
+   Appended last so it refines (never fights) the base sheet.
+   All effects degrade to instant under fx-lite / reduced-motion.
+   ============================================================ */
+
+/* ── 1. direction-aware page transitions ─────────────────────
+   switchTab() stamps data-nav=fwd|back on #content from the tab
+   order, so moving right slides in from the right and vice versa.
+   The outgoing view is kept alive for one frame to cross-fade. */
+#content[data-nav="fwd"]  .view.is-active{ animation:viewInFwd .3s var(--ease) both; }
+#content[data-nav="back"] .view.is-active{ animation:viewInBack .3s var(--ease) both; }
+@keyframes viewInFwd { from{ opacity:0; transform:translateX(24px) } to{ opacity:1; transform:none } }
+@keyframes viewInBack{ from{ opacity:0; transform:translateX(-24px)} to{ opacity:1; transform:none } }
+.view.is-active{ z-index:2; }
+.view.is-leaving{
+  display:flex; z-index:1; pointer-events:none;
+  animation:viewOut .24s var(--ease) both;
+}
+@keyframes viewOut{ from{ opacity:1; transform:none } to{ opacity:0; transform:translateY(8px) } }
+
+/* ── 2. staggered list entrance (no JS delay bookkeeping) ───── */
+@keyframes itemIn{ from{ opacity:0; transform:translateY(10px) } to{ opacity:1; transform:none } }
+.view.is-active #memberList > *,
+.view.is-active #queueList  > *,
+.view.is-active #results    > *,
+.sheet.is-open  .sheet-rows > *,
+.sheet.is-open  .chat-rows  > *,
+.sheet.is-open  .forward-list > *{
+  animation:itemIn .38s var(--ease) both;
+}
+.view.is-active #memberList > *:nth-child(1),
+.view.is-active #queueList > *:nth-child(1),
+.view.is-active #results > *:nth-child(1),
+.sheet.is-open .sheet-rows > *:nth-child(1),
+.sheet.is-open .chat-rows > *:nth-child(1),
+.sheet.is-open .forward-list > *:nth-child(1){ animation-delay:0ms; }
+.view.is-active #memberList > *:nth-child(2),
+.view.is-active #queueList > *:nth-child(2),
+.view.is-active #results > *:nth-child(2),
+.sheet.is-open .sheet-rows > *:nth-child(2),
+.sheet.is-open .chat-rows > *:nth-child(2),
+.sheet.is-open .forward-list > *:nth-child(2){ animation-delay:32ms; }
+.view.is-active #memberList > *:nth-child(3),
+.view.is-active #queueList > *:nth-child(3),
+.view.is-active #results > *:nth-child(3),
+.sheet.is-open .sheet-rows > *:nth-child(3),
+.sheet.is-open .chat-rows > *:nth-child(3),
+.sheet.is-open .forward-list > *:nth-child(3){ animation-delay:64ms; }
+.view.is-active #memberList > *:nth-child(4),
+.view.is-active #queueList > *:nth-child(4),
+.view.is-active #results > *:nth-child(4),
+.sheet.is-open .sheet-rows > *:nth-child(4),
+.sheet.is-open .chat-rows > *:nth-child(4),
+.sheet.is-open .forward-list > *:nth-child(4){ animation-delay:96ms; }
+.view.is-active #memberList > *:nth-child(5),
+.view.is-active #queueList > *:nth-child(5),
+.view.is-active #results > *:nth-child(5),
+.sheet.is-open .sheet-rows > *:nth-child(5),
+.sheet.is-open .chat-rows > *:nth-child(5),
+.sheet.is-open .forward-list > *:nth-child(5){ animation-delay:128ms; }
+.view.is-active #memberList > *:nth-child(6),
+.view.is-active #queueList > *:nth-child(6),
+.view.is-active #results > *:nth-child(6),
+.sheet.is-open .sheet-rows > *:nth-child(6),
+.sheet.is-open .chat-rows > *:nth-child(6),
+.sheet.is-open .forward-list > *:nth-child(6){ animation-delay:160ms; }
+.view.is-active #memberList > *:nth-child(7),
+.view.is-active #queueList > *:nth-child(7),
+.view.is-active #results > *:nth-child(7),
+.sheet.is-open .sheet-rows > *:nth-child(7),
+.sheet.is-open .chat-rows > *:nth-child(7),
+.sheet.is-open .forward-list > *:nth-child(7){ animation-delay:192ms; }
+.view.is-active #memberList > *:nth-child(8),
+.view.is-active #queueList > *:nth-child(8),
+.view.is-active #results > *:nth-child(8),
+.sheet.is-open .sheet-rows > *:nth-child(8),
+.sheet.is-open .chat-rows > *:nth-child(8),
+.sheet.is-open .forward-list > *:nth-child(8){ animation-delay:224ms; }
+.view.is-active #memberList > *:nth-child(9),
+.view.is-active #queueList > *:nth-child(9),
+.view.is-active #results > *:nth-child(9),
+.sheet.is-open .sheet-rows > *:nth-child(9),
+.sheet.is-open .chat-rows > *:nth-child(9),
+.sheet.is-open .forward-list > *:nth-child(9){ animation-delay:256ms; }
+.view.is-active #memberList > *:nth-child(10),
+.view.is-active #queueList > *:nth-child(10),
+.view.is-active #results > *:nth-child(10),
+.sheet.is-open .sheet-rows > *:nth-child(10),
+.sheet.is-open .chat-rows > *:nth-child(10),
+.sheet.is-open .forward-list > *:nth-child(10){ animation-delay:288ms; }
+.view.is-active #memberList > *:nth-child(n+11),
+.view.is-active #queueList > *:nth-child(n+11),
+.view.is-active #results > *:nth-child(n+11),
+.sheet.is-open .sheet-rows > *:nth-child(n+11){ animation-delay:290ms; }
+
+/* ── 3. sliding tab indicator ────────────────────────────────
+   A single pill slides under the active tab instead of each tab
+   re-painting its own background; transform-only = 60fps. */
+.tabbar{ position:relative; }
+.tab-ind{
+  position:absolute; left:5px; top:5px;
+  width:calc((100% - 10px - 8px) / 5); height:calc(100% - 10px);
+  border-radius:19px; background:#f5f5f6;
+  box-shadow:0 6px 18px -8px rgba(255,255,255,.45);
+  transform:translateX(calc(var(--tab-i, 0) * (100% + 2px)));
+  transition:transform .36s var(--ease);
+  pointer-events:none; z-index:0; will-change:transform;
+}
+.tab{ position:relative; z-index:1; background:transparent !important; }
+.tab.is-active{ box-shadow:none; }
+.tab.is-active .ic{ animation:tabPop .4s var(--ease); }
+@keyframes tabPop{ 0%{ transform:scale(.8) } 60%{ transform:scale(1.14) } 100%{ transform:scale(1) } }
+.tab-dot{ z-index:2; }
+
+/* ── 4. global ripple / tap feedback ──────────────────────────
+   One delegated listener stamps a lightweight span on any
+   .tap-fx host. It never blocks the real click (pointer-events
+   none) and removes itself on animationend. */
+.tap-fx{ position:relative; }
+.ripple{
+  position:absolute; border-radius:50%; pointer-events:none;
+  background:radial-gradient(circle, rgba(255,255,255,.32), rgba(255,255,255,0) 70%);
+  transform:translate(-50%,-50%) scale(0);
+  animation:rippleOut .5s var(--ease) forwards;
+  z-index:3;
+}
+@keyframes rippleOut{ to{ transform:translate(-50%,-50%) scale(1); opacity:0 } }
+
+/* press-scale for the long tail of small controls that had none */
+.sheet-row:active, .chat-row:active, .result:active, .sticker-cell:active,
+.chip:active, .pack-chip:active, .seg-btn:active, .sleep-opt:active,
+.sticker-tab:active, .pill-icon:active, .ghost-circle:active,
+.unban-btn:active, .round-mini:active, .chat-switch:active,
+.room-pill:active, .reply-bar:active{ transform:scale(.98); }
+.sheet-row, .chat-row, .result, .chip, .pack-chip, .seg-btn, .sleep-opt,
+.sticker-tab, .pill-icon, .ghost-circle, .unban-btn, .round-mini,
+.chat-switch{ transition:transform .16s var(--ease), background .16s var(--ease); }
+
+/* hover affordances for desktop / web preview */
+@media (hover:hover) and (pointer:fine){
+  .round-btn:hover{ background:rgba(255,255,255,.12); }
+  .sheet-row:hover, .chat-row:hover, .result:hover{ background:rgba(255,255,255,.045); }
+  .sticker-cell:hover{ background:rgba(255,255,255,.08); }
+  .chip:hover, .pack-chip:hover{ border-color:rgba(255,255,255,.24); }
+  .exit-btn:hover{ background:rgba(255,77,79,.16); color:#ff8f99; border-color:rgba(255,77,79,.3); }
+}
+
+/* keyboard focus (a11y) — visible ring, never on mouse click */
+:where(button, [role="button"], a, input, [contenteditable]):focus-visible{
+  outline:2px solid var(--accent); outline-offset:2px; border-radius:8px;
+}
+
+/* ── 5. toast variants + action + tap-to-dismiss ─────────────── */
+.toast{ display:flex; align-items:center; gap:8px; pointer-events:none; }
+.toast.is-on{ pointer-events:auto; cursor:default; }
+.toast-ic{ width:15px; height:15px; flex:0 0 auto; }
+.toast-msg{ flex:1; min-width:0; }
+.toast-act{
+  flex:0 0 auto; font-size:10px; font-weight:700; letter-spacing:.02em;
+  padding:3px 9px; border-radius:999px; background:rgba(0,0,0,.12);
+  color:inherit; -webkit-tap-highlight-color:transparent;
+}
+.toast-act:active{ transform:scale(.94); }
+.toast[data-kind="success"]{ background:rgba(52,199,123,.97); color:#04220f; }
+.toast[data-kind="error"]{ background:rgba(255,86,90,.97); color:#fff; }
+.toast[data-kind="warn"]{ background:rgba(255,190,80,.97); color:#2a1a00; }
+.toast[data-kind="info"]{ background:rgba(240,240,242,.96); color:#0b0b0c; }
+.toast[data-kind="error"] .toast-act{ background:rgba(255,255,255,.22); }
+.toast[data-kind="info"] .toast-act{ background:rgba(0,0,0,.1); }
+
+/* ── 6. sheet spring + drag-to-dismiss + app recede ──────────
+   A slight overshoot makes sheets feel physical. While dragging,
+   JS sets --drag (px) and .is-dragging kills the transition so the
+   sheet follows the finger exactly. */
+.sheet{ transition:transform .4s cubic-bezier(.2,1.06,.3,1); will-change:transform; }
+.sheet.is-open{ transform:translateY(var(--drag, 0px)); }
+.sheet.is-dragging{ transition:none; }
+.sheet-grab{ transition:background .2s var(--ease), width .2s var(--ease); }
+.sheet.is-dragging .sheet-grab{ background:rgba(255,255,255,.5); width:52px; }
+#screen.sheet-open .app{ transform:scale(.985) translateY(-4px); filter:brightness(.86); }
+.app{ transition:transform .4s var(--ease), filter .4s var(--ease); }
+.scrim{ transition:opacity .3s var(--ease); }
+
+/* ── 7. connection / reconnect bar ──────────────────────────── */
+.net-bar{
+  position:absolute; z-index:12; top:calc(var(--safe-top) + var(--top-pad) + 48px);
+  left:50%; transform:translate(-50%,-8px);
+  display:flex; align-items:center; gap:7px;
+  padding:6px 13px; border-radius:999px;
+  background:rgba(20,21,26,.94); border:1px solid rgba(255,255,255,.1);
+  backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  box-shadow:0 10px 26px -12px rgba(0,0,0,.9);
+  font-size:9.5px; color:#d6d7db; white-space:nowrap;
+  opacity:0; pointer-events:none;
+  transition:opacity .28s var(--ease), transform .28s var(--ease);
+}
+.net-bar.is-on{ opacity:1; transform:translate(-50%,0); }
+.net-bar[data-kind="error"]{ color:#ff9ea0; border-color:rgba(255,77,79,.32); }
+.net-bar[data-kind="ok"]{ color:#8ee7b6; border-color:rgba(61,220,132,.3); }
+.net-spinner{
+  width:9px; height:9px; border-radius:50%; flex:0 0 auto;
+  border:1.6px solid rgba(255,255,255,.25); border-top-color:#8cc6ff;
+  animation:spin .7s linear infinite;
+}
+.net-bar[data-kind="ok"] .net-spinner{ display:none; }
+@keyframes spin{ to{ transform:rotate(360deg) } }
+
+/* ── 8. jump-to-latest floating pill ────────────────────────── */
+.jump-latest{
+  position:absolute; z-index:8; right:14px; bottom:74px;
+  display:flex; align-items:center; gap:6px;
+  height:32px; padding:0 12px; border-radius:999px;
+  background:rgba(30,31,37,.94); border:1px solid rgba(255,255,255,.14);
+  backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  box-shadow:0 10px 26px -10px rgba(0,0,0,.9);
+  color:#e8e9ec; font-size:10px; font-weight:600;
+  opacity:0; transform:translateY(10px) scale(.92); pointer-events:none;
+  transition:opacity .26s var(--ease), transform .26s var(--ease);
+}
+.jump-latest.is-on{ opacity:1; transform:none; pointer-events:auto; }
+.jump-latest:active{ transform:scale(.94); }
+.jump-count{
+  font-style:normal; font-size:8.5px; font-weight:700; color:#fff;
+  min-width:16px; height:16px; padding:0 4px; border-radius:999px;
+  background:#2f9bff; display:grid; place-items:center;
+  animation:tabPop .36s var(--ease);
+}
+
+/* ── 9. new-message highlight (only for freshly inserted rows) ── */
+.msg.is-new .bubble{ animation:newMsg .7s var(--ease); }
+@keyframes newMsg{
+  0%{ box-shadow:0 0 0 0 rgba(47,155,255,.5) }
+  55%{ box-shadow:0 0 0 5px rgba(47,155,255,0) }
+  100%{ box-shadow:0 0 0 0 rgba(47,155,255,0) }
+}
+
+/* ── 10. send button busy state ─────────────────────────────── */
+.pill-send.is-busy{ pointer-events:none; opacity:.75; }
+.pill-send.is-busy .ic{ animation:sendSpin .8s linear infinite; }
+@keyframes sendSpin{ to{ transform:rotate(360deg) } }
+
+/* ── 11. media fade-in (no white flash on slow sticker loads) ── */
+.msg .bubble.media img, .msg .bubble.sticker img, .sticker-cell img,
+.result img, .member-row img, .q-thumb{ animation:imgFade .35s var(--ease) both; }
+@keyframes imgFade{ from{ opacity:0 } to{ opacity:1 } }
+
+/* ── 12. exit sheet ─────────────────────────────────────────── */
+.exit-sheet .sheet-rows{ margin-top:6px; }
+.exit-hero{ text-align:center; padding:6px 10px 14px; }
+.exit-hero-ic{
+  width:52px; height:52px; margin:0 auto 12px; border-radius:18px;
+  display:grid; place-items:center;
+  background:linear-gradient(150deg, rgba(255,77,79,.2), rgba(255,77,79,.05));
+  border:1px solid rgba(255,77,79,.24); color:#ff8f99;
+  animation:exitFloat 3.4s ease-in-out infinite;
+}
+.exit-hero-ic .ic{ width:24px; height:24px; }
+@keyframes exitFloat{ 0%,100%{ transform:translateY(0) } 50%{ transform:translateY(-4px) } }
+
+/* ── 13. exit button + misc polish ─────────────────────────── */
+.exit-btn{ color:#c9c9cc; }
+.exit-btn:active{ background:rgba(255,77,79,.16); color:#ff8f99; }
+.toast-ic{ color:inherit; }
+
+/* ── 14. motion guards: lite mode, reduced motion, hidden tab ──
+   The base file already nukes all durations for prefers-reduced-motion;
+   here we additionally remove the *structural* effects (ripples, the
+   leaving-view clone, the app recede) that would otherwise still flash. */
+@media (prefers-reduced-motion: reduce){
+  .ripple{ display:none !important; }
+  .view.is-leaving{ display:none !important; }
+  #screen.sheet-open .app{ transform:none !important; filter:none !important; }
+}
+html.fx-lite .ripple{ display:none !important; }
+html.fx-lite #content[data-nav] .view.is-active{ animation:none !important; }
+html.fx-lite .view.is-leaving{ display:none !important; }
+html.fx-lite .view.is-active #memberList > *,
+html.fx-lite .view.is-active #queueList > *,
+html.fx-lite .view.is-active #results > *,
+html.fx-lite .sheet.is-open .sheet-rows > *,
+html.fx-lite .sheet.is-open .chat-rows > *,
+html.fx-lite .sheet.is-open .forward-list > *{ animation:none !important; }
+html.fx-lite .sheet{ transition:transform .2s linear !important; }
+html.fx-lite #screen.sheet-open .app{ transform:none !important; filter:none !important; }
+html.fx-lite .net-bar, html.fx-lite .jump-latest{ transition:opacity .15s linear !important; }
+/* Backgrounded tab: freeze every animation so the WebView stops burning
+   CPU on Lottie/spinners/equalizer while the user is not looking. */
+html.app-hidden *, html.app-hidden *::before, html.app-hidden *::after{
+  animation-play-state:paused !important;
+}
+
+/* ── 15. hidden-attribute guards (opacity-based widgets) ───── */
+.net-bar[hidden], .jump-latest[hidden], .jump-count[hidden],
+.toast-act[hidden]{ display:none !important; }
+
+/* ── 16. sheet footer / about line ─────────────────────────── */
+.sheet-foot{
+  margin-top:12px; padding:10px 4px 2px; text-align:center;
+  font-size:8.5px; color:#5c5d63; letter-spacing:.02em;
+}
+
+/* ── 17. "app closed" curtain for browser previews ─────────── */
+.exit-curtain{
+  position:fixed; inset:0; z-index:9999;
+  display:grid; place-items:center;
+  background:radial-gradient(60% 50% at 50% 42%, rgba(47,155,255,.12), transparent 70%), #050506;
+  animation:curtainIn .34s var(--ease) both;
+}
+.exit-curtain.is-out{ animation:curtainOut .28s var(--ease) both; }
+@keyframes curtainIn{ from{ opacity:0 } to{ opacity:1 } }
+@keyframes curtainOut{ to{ opacity:0 } }
+.exit-curtain-card{
+  width:min(320px, 84vw); display:flex; flex-direction:column; align-items:center;
+  gap:10px; text-align:center; padding:30px 26px;
+  border-radius:24px; background:rgba(22,23,28,.9);
+  border:1px solid rgba(255,255,255,.09);
+  box-shadow:0 30px 80px -30px rgba(0,0,0,.9);
+}
+.exit-curtain-ic{
+  width:56px; height:56px; border-radius:20px; display:grid; place-items:center;
+  background:rgba(61,220,132,.12); border:1px solid rgba(61,220,132,.28); color:#7de2ab;
+}
+.exit-curtain-ic .ic{ width:26px; height:26px; }
+.exit-curtain-card b{ font-size:16px; font-weight:600; }
+.exit-curtain-card > span:not(.exit-curtain-ic){ font-size:11px; line-height:1.6; color:#9a9ba1; }

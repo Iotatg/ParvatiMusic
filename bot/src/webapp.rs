@@ -79,6 +79,8 @@ use crate::room::{RoomState, Rooms};
 const MAX_BODY: usize = 64 * 1024;
 const CHAT_CAP: usize = 300;
 const ROSTER_TTL: u64 = 20;
+/// How long a completed chat-send idempotency key stays replayable.
+const SEND_DEDUPE_TTL: u64 = 120;
 /// How long a "user X is admin of group Y" answer stays usable.
 const ADMIN_TTL: u64 = 120;
 
@@ -211,6 +213,12 @@ pub struct MiniApp {
     /// One roster pass at a time: a burst of requests used to start several
     /// 25-call member lookups at once, which is what made the app stutter.
     roster_busy: AtomicBool,
+    /// Short-lived idempotency ledger for chat sends: `uid:chat:clientId` →
+    /// (posted at, message). A response lost on a flaky mobile network makes
+    /// the client retry with the *same* client id; returning the stored
+    /// message stops a duplicate Telegram post. A Null message marks a send
+    /// that is still in flight, so two concurrent taps cannot both post.
+    send_dedupe: Mutex<HashMap<String, (u64, Value)>>,
     /// Optional shared secret (`MINIAPP_TOKEN`) for trusted integrations. It
     /// never grants a *user* identity — only the control plane.
     token: String,
@@ -549,6 +557,7 @@ pub fn install(rooms: Rooms) {
         favs: Mutex::new(Vec::new()),
         sleep_at: Mutex::new(0),
         roster_busy: AtomicBool::new(false),
+        send_dedupe: Mutex::new(HashMap::new()),
         token: env_str("MINIAPP_TOKEN", ""),
         bot_token: {
             let t = env_str("TOKEN", "");
@@ -1322,16 +1331,19 @@ impl MiniApp {
         viewer: Option<&Auth>,
         cur: &mut Cursor,
     ) -> std::io::Result<()> {
+        let chat = self.chat_for(viewer);
         let mut state_val = self.snapshot(false, viewer);
         // The switcher rides on the state stream too. Without it the chat list
         // only refreshed on a manual /api/state, so a group the bot had just
         // joined stayed invisible until the app was reopened.
         if let Some(o) = state_val.as_object_mut() {
-            let chat = self.chat_for(viewer);
             o.insert("chat".to_string(), self.chat_head(chat, viewer));
             o.insert("chats".to_string(), json!(self.chat_list(viewer)));
         }
-        let state = json!({ "type": "state", "data": state_val.clone() }).to_string();
+        // Tag the frame with the chat it describes. A frame minted just before
+        // /api/chat/select landed would otherwise pull the header back to the
+        // group the viewer just left.
+        let state = json!({ "type": "state", "chat": chat.to_string(), "data": state_val.clone() }).to_string();
         // The playhead moves every second, which used to make *every* frame a
         // "change" and re-render the whole app. Compare without `position`
         // (the client interpolates it locally) and only re-send the playhead
@@ -1348,7 +1360,6 @@ impl MiniApp {
             write!(res, "data: {state}\n\n")?;
         }
 
-        let chat = self.chat_for(viewer);
         let messages = json!({
             "type": "messages",
             "chat": chat.to_string(),
@@ -1426,6 +1437,65 @@ impl MiniApp {
             .unwrap_or_else(|e| e.into_inner())
             .get(&chat)
             .and_then(|q| q.iter().find(|m| m["mid"].as_i64() == Some(mid)).cloned())
+    }
+
+    /// Claim a client id for a chat send. Returns the already-created message
+    /// when this is a retry, `None` when the caller may proceed (the key is
+    /// reserved as in-flight), or `Err` when the same id is still in flight
+    /// and did not settle in time. Keys expire so a crash cannot poison them.
+    fn send_claim(&self, uid: i64, chat: i64, client_id: &str) -> Result<Option<Value>, ()> {
+        if client_id.is_empty() {
+            return Ok(None);
+        }
+        let key = format!("{uid}:{chat}:{client_id}");
+        let now = now_secs();
+        {
+            let mut map = self.send_dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, (at, _)| now.saturating_sub(*at) < SEND_DEDUPE_TTL);
+            match map.get(&key) {
+                Some((_, v)) if !v.is_null() => return Ok(Some(v.clone())),
+                Some(_) => {} // in flight: fall through and wait for it
+                None => {
+                    map.insert(key.clone(), (now, Value::Null));
+                    return Ok(None);
+                }
+            }
+        }
+        // A retry arriving while the first post is still talking to Telegram.
+        // Wait briefly for that result instead of posting a second time.
+        for _ in 0..100 {
+            thread::sleep(Duration::from_millis(60));
+            let mut map = self.send_dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&key) {
+                Some((_, v)) if !v.is_null() => return Ok(Some(v.clone())),
+                None => {
+                    // The first attempt failed and released the key: this
+                    // retry may take over and post exactly once.
+                    map.insert(key, (now_secs(), Value::Null));
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+        Err(())
+    }
+
+    /// Record the outcome of a claimed send. `None` releases the reservation
+    /// so a genuinely failed send can be retried with the same client id.
+    fn send_finish(&self, uid: i64, chat: i64, client_id: &str, msg: Option<&Value>) {
+        if client_id.is_empty() {
+            return;
+        }
+        let key = format!("{uid}:{chat}:{client_id}");
+        let mut map = self.send_dedupe.lock().unwrap_or_else(|e| e.into_inner());
+        match msg {
+            Some(v) => {
+                map.insert(key, (now_secs(), v.clone()));
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
     }
 
     fn push_message(&self, chat: i64, msg: Value) {
@@ -3389,13 +3459,46 @@ fn saved_stickers_file(me: &str) -> PathBuf {
 }
 
 fn saved_stickers_read(me: &str) -> Vec<Value> {
-    let Ok(raw) = std::fs::read(saved_stickers_file(me)) else {
+    let path = saved_stickers_file(me);
+    let Ok(raw) = std::fs::read(&path) else {
         return Vec::new();
     };
     match serde_json::from_slice::<Vec<Value>>(&raw) {
-        Ok(list) => list,
-        Err(_) => Vec::new(),
+        // Only objects belong in the list; a stray string/number used to make
+        // renderPane() throw when it read s.media_kind.
+        Ok(list) => list.into_iter().filter(|v| v.is_object()).collect(),
+        Err(_) => {
+            // A truncated write must not silently look like "no stickers":
+            // the next save would overwrite the file and lose the good data.
+            // Quarantine it so it can be recovered by hand.
+            let backup = path.with_extension(format!("corrupt-{}.json", now_ms()));
+            let _ = std::fs::rename(&path, &backup);
+            Vec::new()
+        }
     }
+}
+
+/// Whitelist + length-cap one saved sticker. The list is written to disk and
+/// later injected back into the DOM, so unbounded strings or arbitrary keys
+/// are both a size and an injection hazard.
+fn sanitize_saved_sticker(raw: &Value) -> Option<Value> {
+    let obj = raw.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in ["id", "emoji", "media", "media_kind", "file_id", "mediaKey", "thumb", "set"] {
+        if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
+            out.insert(key.to_string(), json!(v.chars().take(512).collect::<String>()));
+        }
+    }
+    for key in ["video", "animated"] {
+        if let Some(v) = obj.get(key).and_then(|v| v.as_bool()) {
+            out.insert(key.to_string(), json!(v));
+        }
+    }
+    let id = out.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() || id.len() > 96 {
+        out.insert("id".to_string(), json!(format!("sv{}", now_ms())));
+    }
+    Some(Value::Object(out))
 }
 
 fn saved_stickers_write(me: &str, list: &[Value]) -> bool {
@@ -3850,6 +3953,26 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     req_body["media_key"] = json!(media_key);
                 }
             }
+            // Echo the client's idempotency key back. The mini app renders an
+            // optimistic bubble while the request is in flight; without this
+            // echo an SSE frame that arrives first would look like a *second*
+            // message and the bubble would flicker or duplicate.
+            let client_id = body["clientId"].as_str().unwrap_or("").chars().take(64).collect::<String>();
+
+            // Idempotency: a response lost on a flaky mobile network makes the
+            // client retry with the same client id. Replay the first result
+            // instead of posting the message to Telegram a second time.
+            let dedupe_uid = auth.id();
+            match app.send_claim(dedupe_uid, target, &client_id) {
+                Ok(Some(existing)) => {
+                    return (200, json!({ "ok": true, "message": existing, "duplicate": true }));
+                }
+                Err(()) => {
+                    return (409, json!({ "error": "send already in progress" }));
+                }
+                Ok(None) => {}
+            }
+
             // Preview/seed path: store the message for this instance only.
             // Handy for screenshots and demos without posting to the group.
             if body["local"].as_bool().unwrap_or(false) {
@@ -3859,6 +3982,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 );
                 let msg = json!({
                     "id": format!("loc{}", now_ms()),
+                    "clientId": client_id,
                     "mid": 0,
                     "from": sender_id,
                     "name": sender_name,
@@ -3880,10 +4004,11 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     "reacts": body.get("reacts").cloned().unwrap_or(json!([])),
                 });
                 app.push_message(target, msg.clone());
+                app.send_finish(dedupe_uid, target, &client_id, Some(&msg));
                 return (200, json!({ "ok": true, "message": msg }));
             }
 
-            match tg_post("/send", &req_body) {
+            let outcome = match tg_post("/send", &req_body) {
                 Some((code, res)) if code == 200 && res["ok"] == true => {
                     // Attribute the message to the verified Telegram user, not
                     // to whatever id the client put in the body.
@@ -3893,6 +4018,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     let mid = res["message_id"].as_i64().unwrap_or(0);
                     let msg = json!({
                         "id": format!("l{mid}"),
+                        "clientId": client_id,
                         "mid": mid,
                         "from": sender_id,
                         "name": sender_name,
@@ -3914,13 +4040,18 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                         "date": res["date"].as_i64().unwrap_or(now_secs() as i64),
                     });
                     app.push_message(target, msg.clone());
-                    return (200, json!({ "ok": true, "message": msg }));
+                    app.send_finish(dedupe_uid, target, &client_id, Some(&msg));
+                    (200, json!({ "ok": true, "message": msg }))
                 }
                 Some((_, res)) => {
-                    return (502, json!({ "error": res["error"].as_str().unwrap_or("send failed") }))
+                    (502, json!({ "error": res["error"].as_str().unwrap_or("send failed") }))
                 }
-                None => return (503, json!({ "error": "telegram bridge offline" })),
+                None => (503, json!({ "error": "telegram bridge offline" })),
+            };
+            if outcome.0 != 200 {
+                app.send_finish(dedupe_uid, target, &client_id, None);
             }
+            return outcome;
         }
         "/api/chat/react" => {
             let mid = body["mid"].as_i64().unwrap_or(0);
@@ -4208,18 +4339,11 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 }
                 "clear" => list.clear(),
                 _ => {
-                    let mut s = body["sticker"].clone();
-                    if !s.is_object() {
+                    let Some(mut s) = sanitize_saved_sticker(&body["sticker"]) else {
                         return (400, json!({ "error": "sticker" }));
-                    }
-                    let sid = s["id"].as_str().unwrap_or("").to_string();
-                    let sid = if sid.is_empty() {
-                        format!("sv{}", now_ms())
-                    } else {
-                        sid
                     };
+                    let sid = s["id"].as_str().unwrap_or("").to_string();
                     if let Some(o) = s.as_object_mut() {
-                        o.insert("id".to_string(), json!(sid.clone()));
                         o.insert("saved_at".to_string(), json!(now_secs()));
                     }
                     // Re-saving moves a sticker to the top instead of adding a
@@ -4396,9 +4520,12 @@ fn serve_static(app: &MiniApp, stream: &mut TcpStream, path: &str) -> std::io::R
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nConnection: close\r\n\r\n",
         bytes.len(),
-        // The HTML and the auth bootstrap must never be served stale: a cached
-        // app.js from before an auth change would leave the app in a 401 loop.
-        cache = if mime == MIME_HTML {
+        // HTML, CSS and JS must never be served stale. index.html is already
+        // no-store, so caching app.js/app.css for even 60 s lets a fresh page
+        // load pair with an old script — the exact mismatch that used to
+        // leave the app in a 401 loop after an auth change. Images are
+        // immutable by name and can keep a short cache.
+        cache = if mime == MIME_HTML || mime == MIME_CSS || mime == MIME_JS {
             "no-store"
         } else {
             "public, max-age=60"
@@ -4734,6 +4861,7 @@ mod chat_tests {
             favs: Mutex::new(Vec::new()),
             sleep_at: Mutex::new(0),
             roster_busy: AtomicBool::new(false),
+            send_dedupe: Mutex::new(HashMap::new()),
             token: String::new(),
             bot_token: String::new(),
             allowed_ids: Vec::new(),
@@ -4995,5 +5123,163 @@ mod chat_tests {
             "a missing mirror must clear the in-memory copy"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /* ── chat-send idempotency + saved-sticker hardening ─────────────
+     * A lost mobile response makes the mini app retry with the same
+     * `clientId`. These tests pin the "post exactly once" contract and the
+     * whitelist that keeps a saved sticker from becoming an injection
+     * vector when it is written to disk and later injected into the DOM. */
+
+    fn post(path: &str, body: Value) -> Request {
+        Request {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            body: serde_json::to_vec(&body).unwrap(),
+            header_token: None,
+            init_data: None,
+            cookies: std::collections::HashMap::new(),
+            range: None,
+        }
+    }
+
+    #[test]
+    fn send_claim_reserves_once_and_replays_the_settled_message() {
+        let (app, dir) = app();
+        let uid = 7i64;
+        let cid = "c-abc";
+        // First claim reserves the key as in-flight.
+        assert_eq!(app.send_claim(uid, HOME, cid), Ok(None));
+        // A concurrent retry must NOT get a second "proceed": it waits for
+        // the first post and then replays its result.
+        let settled = json!({ "id": "m1", "clientId": cid, "text": "hello" });
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                thread::sleep(Duration::from_millis(180));
+                app.send_finish(uid, HOME, cid, Some(&settled));
+            });
+            assert_eq!(app.send_claim(uid, HOME, cid), Ok(Some(settled.clone())));
+            h.join().unwrap();
+        });
+        // A later retry replays the stored message immediately.
+        assert_eq!(app.send_claim(uid, HOME, cid), Ok(Some(settled)));
+        // Viewer, chat and client id are all part of the key.
+        assert_eq!(app.send_claim(uid + 1, HOME, cid), Ok(None));
+        assert_eq!(app.send_claim(uid, OTHER, cid), Ok(None));
+        assert_eq!(app.send_claim(uid, HOME, "c-other"), Ok(None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_send_releases_its_key_so_a_retry_can_post() {
+        let (app, dir) = app();
+        assert_eq!(app.send_claim(7, HOME, "c-fail"), Ok(None));
+        app.send_finish(7, HOME, "c-fail", None);
+        assert_eq!(app.send_claim(7, HOME, "c-fail"), Ok(None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_client_id_is_never_deduped() {
+        let (app, dir) = app();
+        assert_eq!(app.send_claim(7, HOME, ""), Ok(None));
+        assert_eq!(app.send_claim(7, HOME, ""), Ok(None));
+        app.send_finish(7, HOME, "", Some(&json!({ "id": "x" })));
+        assert_eq!(app.send_claim(7, HOME, ""), Ok(None));
+        assert!(app.send_dedupe.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_send_echoes_client_id_and_replays_a_duplicate() {
+        let (app, dir) = app();
+        let auth = viewer(7);
+        let body = json!({
+            "kind": "text", "text": "hello", "clientId": "c42",
+            "local": true, "senderId": "999", "senderName": "Impostor",
+        });
+        let (code, out) = route_api(&app, &post("/api/chat/send", body.clone()), &auth);
+        assert_eq!(code, 200);
+        assert_eq!(out["message"]["clientId"], "c42");
+        // The verified Telegram identity must override the client's `me`.
+        assert_eq!(out["message"]["from"], "7");
+        assert_eq!(out["message"]["name"], "User 7");
+        assert_eq!(app.chat_msgs(HOME).len(), 1);
+
+        // A retry with the same id replays the same message; no second row.
+        let (code2, out2) = route_api(&app, &post("/api/chat/send", body), &auth);
+        assert_eq!(code2, 200);
+        assert_eq!(out2["duplicate"], true);
+        assert_eq!(out2["message"]["id"], out["message"]["id"]);
+        assert_eq!(app.chat_msgs(HOME).len(), 1);
+
+        // A different client id is a genuinely new message.
+        let fresh = json!({ "kind": "text", "text": "again", "clientId": "c43", "local": true });
+        let (code3, _) = route_api(&app, &post("/api/chat/send", fresh), &auth);
+        assert_eq!(code3, 200);
+        assert_eq!(app.chat_msgs(HOME).len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sanitize_saved_sticker_whitelists_and_caps_fields() {
+        assert!(sanitize_saved_sticker(&json!("not an object")).is_none());
+        assert!(sanitize_saved_sticker(&json!(null)).is_none());
+        let raw = json!({
+            "id": "ok-id",
+            "emoji": "🎵",
+            "media": "https://example/a.png",
+            "media_kind": "image",
+            "video": false,
+            "__proto__": "nope",
+            "onclick": "alert(1)",
+            "huge": "x",
+        });
+        let out = sanitize_saved_sticker(&raw).unwrap();
+        let o = out.as_object().unwrap();
+        assert_eq!(o["id"], "ok-id");
+        assert_eq!(o["emoji"], "🎵");
+        assert_eq!(o["video"], false);
+        assert!(!o.contains_key("__proto__"));
+        assert!(!o.contains_key("onclick"));
+        assert!(!o.contains_key("huge"));
+
+        // Strings are capped, and a missing or oversized id is regenerated.
+        let long = json!({ "id": "z".repeat(200), "media": "m".repeat(4000) });
+        let out2 = sanitize_saved_sticker(&long).unwrap();
+        assert_eq!(out2["media"].as_str().unwrap().chars().count(), 512);
+        assert!(out2["id"].as_str().unwrap().starts_with("sv"));
+        assert!(out2["id"].as_str().unwrap().len() <= 96);
+    }
+
+    #[test]
+    fn saved_sticker_reader_drops_non_objects_and_quarantines_corrupt_json() {
+        let suffix = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let me = format!("pm-test-{}-{}", std::process::id(), suffix);
+        let path = saved_stickers_file(&me);
+        let parent = path.parent().unwrap().to_path_buf();
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(&path, br#"[{"id":"a"}, 42, "junk", {"id":"b"}]"#).unwrap();
+        assert_eq!(saved_stickers_read(&me).len(), 2);
+
+        // A truncated write must be renamed, not silently read as "empty",
+        // otherwise the next save would overwrite the recoverable data.
+        std::fs::write(&path, br#"[{"id":"a""#).unwrap();
+        assert!(saved_stickers_read(&me).is_empty());
+        let quarantined = std::fs::read_dir(&parent).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{stem}.corrupt-"))
+        });
+        assert!(quarantined, "corrupt file should be kept as a recovery backup");
+
+        // Leave no artefacts in the shared cache dir.
+        for e in std::fs::read_dir(&parent).unwrap().flatten() {
+            if e.file_name().to_string_lossy().starts_with(&stem) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 }

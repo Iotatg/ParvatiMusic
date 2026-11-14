@@ -112,8 +112,14 @@
   let chatSig = '';
   /// A long-press or a swipe consumes the click that follows it, so the
   /// tap-to-reply / double-tap-to-react handler must ignore that one event.
+  /// `suppressId` scopes the suppression to the row that raised it: a plain
+  /// global timer used to swallow an unrelated tap on a different bubble.
   let suppressUntil = 0;
-  let suppressGridClick = false;
+  let suppressId = '';
+  /// Timestamp, not a sticky boolean. A saved-sticker long-press may never
+  /// produce a trailing click, and a sticky flag used to eat the *next* legit
+  /// grid tap forever. This window simply expires on its own.
+  let suppressGridClickUntil = 0;
   /// Shared by the tap / double-tap / long-press / swipe handlers so a swipe
   /// or a long-press never also fires the plain tap-to-reply action.
   let lastTap = { id: '', at: 0 };
@@ -139,17 +145,73 @@
   const lastSig = { members: '', queue: '', song: '', session: '', chat: '', profile: '' };
   let errSeenAt = 0;
 
+  /* ── keyed chat rendering ───────────────────────────────────────────
+   * Rebuilding #msgs.innerHTML on every tick destroyed every <img>, <video>
+   * and Lottie container: media reloaded, animated stickers restarted, an
+   * in-progress swipe lost its node, and the scroll position jumped. Rows are
+   * now keyed by message id and only patched when their HTML actually changes;
+   * the DOM nodes (and their media/playback state) are reused. */
+  const chatRows = new Map();          // key -> last HTML string
+  let gestureActive = false;           // raised by wireChatGestures
+  let chatRenderDeferred = false;      // a frame landed mid-gesture
+  let paneGen = 0;                     // sticker pack render generation
+  let savedSeq = 0;                    // saved-sticker request sequence
+  let savedHold = null;                // { id, x0, y0, timer } long-press
+  let stickerSending = false;          // double-tap guard for sticker sends
+
+  /// Optimistic bubbles and reactions that the server has not acknowledged
+  /// yet. SSE frames / state polls used to overwrite them outright, so a
+  /// message flickered out and back while being sent and a heart vanished on
+  /// the next tick. Every server timeline is merged through these two maps.
+  const pendingMsgs = new Map();    // local id -> { msg, at, clientId }
+  const pendingReacts = new Map();  // mid -> { emoji, at }
+  const PENDING_TTL = 20000;
+  /// Signature of the last *server* message frame (without pending bubbles),
+  /// so an unchanged frame is skipped even while a send is in flight.
+  let serverChatSig = '';
+
+  const chatKey = () => String(state.chat?.id ?? '');
+
+  /// Every optimistic entry is tagged with the chat it was created for. A
+  /// viewer can switch groups while a send is still in flight; without this a
+  /// pending bubble (or its server echo) would surface in the wrong group.
+  /// Called on every switch / clear / forget / leave / end / refresh / boot.
+  function resetChatTransient() {
+    pendingMsgs.clear();
+    pendingReacts.clear();
+    serverChatSig = '';
+    chatSig = '';
+    chatRows.clear();
+    lastSig.chat = '';
+    chatRenderDeferred = false;
+    renderChat._first = undefined;
+  }
+
+  function clearSavedHold() {
+    if (savedHold) { clearTimeout(savedHold.timer); savedHold = null; }
+  }
+
   /* ────────────────────────── api ────────────────────────── */
-  async function api(path, body) {
+  async function api(path, body, timeoutMs = 25000) {
     const headers = { 'content-type': 'application/json' };
     if (TOKEN) headers['x-miniapp-token'] = TOKEN;
     // Header values must stay ASCII: initData contains '&' and '='.
     if (INIT_DATA) headers['x-telegram-init-data'] = encodeURIComponent(INIT_DATA);
-    const res = await fetch(withAuth(path), body === undefined ? { headers } : {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    // A request that never settles used to leave the UI in a permanent
+    // "sending" state (and an optimistic bubble stuck on screen). Bound it.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(withAuth(path), body === undefined
+        ? { headers, signal: ctl.signal }
+        : { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('request timed out');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) {
       let msg = `${res.status}`;
       try { const j = await res.json(); if (j.error) msg = j.error; if (j.hint) msg = j.hint; } catch {}
@@ -192,8 +254,10 @@
       });
     }
     if (next.messages) {
-      state.messages = next.messages;
-      chatSig = sigOf(next.messages);
+      // A server frame must never erase a message that is still being sent,
+      // nor an optimistic reaction. `mergeMessages` re-attaches pending
+      // bubbles by client id and keeps the server timeline authoritative.
+      mergeMessages(next.messages);
     }
     if (next.session) state.session = { ...(state.session || {}), ...next.session };
     if (typeof next.quote === 'string') state.quote = next.quote;
@@ -203,25 +267,74 @@
     if (next.settings) state.settings = { ...(state.settings || {}), ...next.settings };
   }
 
+  /// Hash of *every* message's volatile fields, not just the last one. The
+  /// old signature only looked at the tail, so editing / reacting to / deleting
+  /// an older bubble never changed it and the chat silently refused to repaint.
   const sigOf = (list) => {
     if (!list || !list.length) return '0';
-    const last = list[list.length - 1];
-    return `${list.length}|${last.id}|${last.mid || 0}|${last.media || ''}|${last.media_kind || ''}|${last.reacted || ''}`;
+    let h = 2166136261;                       // FNV-1a, cheap and stable
+    const feed = (s) => {
+      for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    };
+    feed(String(list.length));
+    for (const m of list) {
+      feed('|');
+      feed(String(m.id ?? '')); feed(String(m.mid ?? 0));
+      feed(String(m.kind ?? '')); feed(String(m.text ?? ''));
+      feed(String(m.reacted ?? '')); feed(String(m.media ?? ''));
+      feed(String(m.media_kind ?? '')); feed(String(m.reply?.mid ?? ''));
+    }
+    return String(h >>> 0);
   };
+
+  /// Merge a server timeline into the view without losing local optimism.
+  /// A pending send is dropped once the server echoes its clientId (or its
+  /// Telegram mid); otherwise it stays appended so the bubble never blinks.
+  /// Optimistic reactions are re-applied until the server confirms them.
+  function mergeMessages(server) {
+    const list = Array.isArray(server) ? server : [];
+    serverChatSig = sigOf(list);
+    const now = Date.now();
+    const key = chatKey();
+    for (const [id, p] of pendingMsgs) {
+      // A stale frame from a previous chat, or an entry that timed out, must
+      // not be re-attached to this chat's timeline.
+      if (p.chat !== key || now - p.at > PENDING_TTL) { pendingMsgs.delete(id); continue; }
+      const echoed = list.some(m =>
+        (p.clientId && String(m.clientId ?? '') === String(p.clientId))
+        || (p.mid && m.mid && String(m.mid) === String(p.mid)));
+      if (echoed) pendingMsgs.delete(id);
+    }
+    for (const [k, r] of pendingReacts) {
+      if (r.chat !== key || now - r.at > PENDING_TTL) pendingReacts.delete(k);
+    }
+    const out = list.map(m => {
+      const r = pendingReacts.get(String(m.mid || 0));
+      return r ? { ...m, reacted: r.emoji } : m;
+    });
+    for (const p of pendingMsgs.values()) out.push(p.msg);
+    state.messages = out;
+    chatSig = sigOf(out);
+  }
 
   async function boot() {
     try {
+      // Fresh session: no optimistic state may leak in from a previous view.
+      resetChatTransient();
       const s = await api('/api/state');
       merge(s);
       online = true;
+      setNet('ok', 'Connected');
       if (!viewer) viewer = { id: String(state.me.id || ''), name: state.me.name || 'you', username: state.me.username || '', photo: state.me.photo || '' };
       connectEvents();
     } catch (e) {
       online = false;
+      setNet('error', 'Offline · reconnecting');
       // The server refused the credential: never fall back to a demo room,
       // that is exactly the "anyone with the link can use it" hole.
       const msg = String((e && e.message) || '');
       if (msg === 'unauthorized' || /Telegram|member|allowed/i.test(msg)) {
+        setNet(null);
         showGate(msg);
         return;
       }
@@ -261,23 +374,24 @@
     try { es = new EventSource(withAuth('/api/events')); }
     catch { scheduleEvents(); return; }
     esCurrent = es;
-    es.onopen = () => { sseLive = true; esRetry = 0; };
+    es.onopen = () => { sseLive = true; esRetry = 0; setNet('ok', 'Live'); };
     es.onmessage = (e) => {
       sseLive = true;
       try {
         const msg = JSON.parse(e.data);
+        // A frame can be minted for the chat the viewer just left and arrive
+        // after /api/chat/select landed. Applying it would paint another
+        // group's header / messages into this one. Both channels now carry the
+        // chat id they describe, so one guard covers both.
+        if (msg.chat && state.chat.id && String(msg.chat) !== String(state.chat.id)) return;
         if (msg.type === 'state') { merge(msg.data); queueRender(); }
         else if (msg.type === 'messages') {
-          // A frame can arrive for the chat the viewer just left; applying it
-          // would paint another group's messages into this one.
-          if (msg.chat && state.chat.id && msg.chat !== state.chat.id) return;
           const sig = sigOf(msg.data);
-          if (sig === chatSig) return;
-          const grew = msg.data.length > state.messages.length;
-          state.messages = msg.data;
-          chatSig = sig;
+          if (sig === serverChatSig) return;   // nothing changed server-side
+          const before = state.messages.length;
+          mergeMessages(msg.data);
           renderChat(true);
-          if (grew) {
+          if (state.messages.length > before) {
             if (activeTab !== 'chat') { unread += 1; paintUnread(); }
             else markRead();
           }
@@ -286,6 +400,7 @@
     };
     es.onerror = () => {
       sseLive = false;
+      setNet('error', 'Reconnecting…');
       try { es.close(); } catch {}
       if (esCurrent === es) esCurrent = null;
       scheduleEvents();
@@ -358,12 +473,50 @@
     }, true);
   }
 
-  function toast(text) {
+  /// Toast with an auto-detected variant, an icon and an optional action.
+  /// Every existing `toast('...')` call keeps working and now gets a colour
+  /// that matches its outcome, so failures no longer look like confirmations.
+  const TOAST_ICON = {
+    info: '#i-info-fill', success: '#i-check-circle',
+    warn: '#i-warn', error: '#i-warn',
+  };
+  function toastKind(text) {
+    if (/fail|error|could not|unable|offline|not allowed|denied|invalid|too long|timed out/i.test(text)) return 'error';
+    if (/saved|cleared|sent|removed|copied|done|unbanned|added|connected|live/i.test(text)) return 'success';
+    if (/careful|again|warn|sure|confirm/i.test(text)) return 'warn';
+    return 'info';
+  }
+  function toast(text, opts = {}) {
     const el = $('#toast');
-    el.textContent = text;
+    const kind = opts.kind || toastKind(text);
+    el.dataset.kind = kind;
+    const msg = $('#toastMsg');
+    if (msg) msg.textContent = text;
+    const use = $('#toastIc use');
+    if (use) use.setAttribute('href', TOAST_ICON[kind] || TOAST_ICON.info);
+    const act = $('#toastAct');
+    if (act) {
+      if (opts.action && typeof opts.onAction === 'function') {
+        act.textContent = opts.action;
+        act.hidden = false;
+        act.onclick = () => { dismissToast(); try { opts.onAction(); } catch {} };
+      } else {
+        act.hidden = true;
+        act.onclick = null;
+      }
+    }
+    // Re-trigger the pop animation even when a second toast replaces the
+    // first one mid-flight (otherwise it just swaps text with no feedback).
+    el.classList.remove('is-on');
+    void el.offsetWidth;
     el.classList.add('is-on');
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => el.classList.remove('is-on'), 1900);
+    toast._t = setTimeout(() => dismissToast(), opts.ms || 2200);
+    return dismissToast;
+  }
+  function dismissToast() {
+    clearTimeout(toast._t);
+    $('#toast').classList.remove('is-on');
   }
 
   /* ────────────────────────── tags ────────────────────────── */
@@ -908,7 +1061,11 @@
   /* sticker + premium-emoji packs (public sets the bot can read) */
   const STICKER_PACKS = ['EmojiPack', 'Twemoji', 'HotCherry', 'EmojiFun'];
   const PREMIUM_PACKS = ['AnimatedEmoji', 'DuckEmoji', 'PepeEmoji'];
+  /// In-flight promises (one request per pack) and their resolved payloads.
+  /// The grid click handler needs the resolved stickers synchronously, so the
+  /// promise and the data are kept in two separate maps.
   const packCache = {};
+  const packData = {};
   let pane = 'emoji';
   let packName = STICKER_PACKS[0];
 
@@ -1001,7 +1158,7 @@
     if (chatScope !== 'vc' || !isLive() || !viewingLiveRoom()) return '';
     const hidden = (state.messages || []).length - visibleMessages().length;
     if (hidden <= 0) return '';
-    return `<div class="scope-hint" data-scope-all="1">
+    return `<div class="scope-hint" data-k="banner" data-scope-all="1">
       <svg class="ic"><use href="#i-users"/></svg>
       <span>${hidden} message${hidden === 1 ? '' : 's'} from members outside the call</span>
       <b>Show all</b>
@@ -1060,19 +1217,82 @@
         let anim = tgsCache.get(url);
         if (!anim) {
           const buf = await (await fetch(url)).arrayBuffer();
+          if (!el.isConnected) continue;      // row was removed while loading
           const stream = new Response(buf).body.pipeThrough(new DecompressionStream('gzip'));
           anim = await new Response(stream).json();
+          if (tgsCache.size >= 40) tgsCache.delete(tgsCache.keys().next().value);
           tgsCache.set(url, anim);
         }
         const lottie = await loadLottie();
         if (!lottie) throw new Error('lottie missing');
-        lottie.loadAnimation({
+        if (!el.isConnected) continue;        // detached mid-load: don't mount
+        // Keep the instance so a removed row can be destroyed instead of
+        // leaking an SVG animation that keeps rendering off-screen forever.
+        el._lottie = lottie.loadAnimation({
           container: el, renderer: 'svg', loop: true, autoplay: true, animationData: anim,
         });
       } catch {
-        el.innerHTML = `<span style="font-size:58px;line-height:1;display:grid;place-items:center;height:100%">${esc(el.dataset.emoji || '🎵')}</span>`;
+        if (el.isConnected) el.innerHTML = `<span style="font-size:58px;line-height:1;display:grid;place-items:center;height:100%">${esc(el.dataset.emoji || '🎵')}</span>`;
       }
     }
+  }
+
+  /// Build exactly one element from a row's HTML string.
+  function chatNode(html) {
+    const t = document.createElement('template');
+    t.innerHTML = html.trim();
+    return t.content.firstElementChild;
+  }
+
+  /// Release any Lottie animation owned by a row that is about to leave the
+  /// DOM; lottie-web keeps a global registry and would otherwise animate a
+  /// detached SVG forever.
+  function destroyChatNode(el) {
+    if (!el) return;
+    const boxes = el.querySelectorAll ? el.querySelectorAll('[data-tgs]') : [];
+    for (const b of boxes) { try { b._lottie?.destroy?.(); } catch {} }
+  }
+
+  /// One chat row. Kept separate from renderChat so the keyed diff can compare
+  /// a single row's HTML instead of rebuilding the whole timeline.
+  function chatRowHTML(m) {
+    const mine = m.mine || String(m.from) === String(viewer?.id);
+    const tags = m.tags || [];
+    const reply = m.reply
+      ? `<div class="reply"><b>${esc(m.reply.name || '')}</b><span>${esc(m.reply.text || '')}</span></div>`
+      : '';
+    let inner;
+    if (m.kind === 'voice') {
+      inner = `<div class="bubble voice">
+          <span class="voice-play"><svg class="ic"><use href="#i-play"/></svg></span>
+          <span class="wave">${waveBars(m.id)}</span>
+          <span class="voice-dur">0:0${m.duration || 5}</span>
+        </div>`;
+    } else if (m.kind === 'photo') {
+      inner = m.media
+        ? `<div class="bubble media"><img src="${esc(m.media)}" alt="" draggable="false" /></div>`
+        : `<div class="bubble media"><img src="${coverURI(m.name || 'photo')}" alt="" draggable="false" /></div>`;
+    } else if (m.kind === 'sticker') {
+      inner = stickerHTML(m);
+    } else {
+      const body = renderText(m.text || '', m.entities);
+      const jumbo = (m.text || '').length <= 12 && JUMBO.test(m.text || '');
+      inner = `<div class="bubble${jumbo ? ' jumbo' : ''}">${reply}${body}</div>`;
+    }
+    const reacted = m.reacted ? `<div class="reacts"><span class="react-chip">${esc(m.reacted)} 1</span></div>` : '';
+    const head = mine
+      ? ''
+      : `<div class="msg-head"><b>${esc(m.name || 'member')}</b>${tagHTML(tags, 2)}<span class="stamp">${esc(m.ts || '')}</span></div>`;
+    return `<div class="msg ${mine ? 'out' : 'in'}" data-k="m:${esc(m.id)}" data-id="${esc(m.id)}" data-mid="${m.mid || 0}" data-from="${esc(m.from || '')}">
+        <span class="swipe-hint"><svg class="ic"><use href="#i-reply"/></svg></span>
+        ${mine ? '' : `<img class="msg-av" src="${esc(pic(m.photo, m.name))}" data-name="${esc(m.name || '?')}" alt="" loading="lazy" decoding="async" draggable="false" />`}
+        <div class="msg-col">
+          ${head}
+          ${inner}
+          ${mine ? `<span class="stamp" style="font-size:7.5px;color:rgba(255,255,255,.26);padding:0 4px">${esc(m.ts || '')}</span>` : ''}
+          ${reacted}
+        </div>
+      </div>`;
   }
 
   function renderChat(force = false) {
@@ -1080,48 +1300,17 @@
     const list = visibleMessages();
     const sig = `${state.chat.id}|${list.length}|${sigOf(list)}|${chatScope}|${chatLive() ? 1 : 0}|${vcIds().size}`;
     if (!force && sig === lastSig.chat) return;
+    // Never swap DOM nodes under an active swipe or long-press: the pointer
+    // capture would be lost and the row would jump out from under the finger.
+    // The next frame is applied as soon as the gesture finishes.
+    if (gestureActive) { chatRenderDeferred = true; return; }
     lastSig.chat = sig;
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
-    const rows = list.map(m => {
-      const mine = m.mine || String(m.from) === String(viewer?.id);
-      const tags = m.tags || [];
-      const reply = m.reply
-        ? `<div class="reply"><b>${esc(m.reply.name || '')}</b><span>${esc(m.reply.text || '')}</span></div>`
-        : '';
-      let inner;
-      if (m.kind === 'voice') {
-        inner = `<div class="bubble voice">
-            <span class="voice-play"><svg class="ic"><use href="#i-play"/></svg></span>
-            <span class="wave">${waveBars(m.id)}</span>
-            <span class="voice-dur">0:0${m.duration || 5}</span>
-          </div>`;
-      } else if (m.kind === 'photo') {
-        inner = m.media
-          ? `<div class="bubble media"><img src="${esc(m.media)}" alt="" draggable="false" /></div>`
-          : `<div class="bubble media"><img src="${coverURI(m.name || 'photo')}" alt="" draggable="false" /></div>`;
-      } else if (m.kind === 'sticker') {
-        inner = stickerHTML(m);
-      } else {
-        const body = renderText(m.text || '', m.entities);
-        const jumbo = (m.text || '').length <= 12 && JUMBO.test(m.text || '');
-        inner = `<div class="bubble${jumbo ? ' jumbo' : ''}">${reply}${body}</div>`;
-      }
-      const reacted = m.reacted ? `<div class="reacts"><span class="react-chip">${esc(m.reacted)} 1</span></div>` : '';
-      const head = mine
-        ? ''
-        : `<div class="msg-head"><b>${esc(m.name || 'member')}</b>${tagHTML(tags, 2)}<span class="stamp">${esc(m.ts || '')}</span></div>`;
-      return `<div class="msg ${mine ? 'out' : 'in'}" data-id="${esc(m.id)}" data-mid="${m.mid || 0}" data-from="${esc(m.from || '')}">
-          <span class="swipe-hint"><svg class="ic"><use href="#i-reply"/></svg></span>
-          ${mine ? '' : `<img class="msg-av" src="${esc(pic(m.photo, m.name))}" data-name="${esc(m.name || '?')}" alt="" loading="lazy" decoding="async" draggable="false" />`}
-          <div class="msg-col">
-            ${head}
-            ${inner}
-            ${mine ? `<span class="stamp" style="font-size:7.5px;color:rgba(255,255,255,.26);padding:0 4px">${esc(m.ts || '')}</span>` : ''}
-            ${reacted}
-          </div>
-        </div>`;
-    }).join('');
+    const first = renderChat._first === undefined;
 
+    // Empty / scope-empty states have no media or gesture to preserve, so a
+    // plain full replace is both cheaper and simpler. Clear the keyed cache so
+    // the next populated render starts from a clean tree.
     if (!state.messages.length) {
       const sm = session();
       const ended = !isLive() && viewingLiveRoom() && (sm.ended_at || 0) > 0;
@@ -1129,7 +1318,7 @@
       const otherLine = others
         ? `<span style="display:block;margin-top:6px">${others} other group chat${others === 1 ? '' : 's'} · tap the group name above to switch</span>`
         : '';
-      box.innerHTML = ended
+      chatReplace(box, ended
         ? `<div class="chat-empty">
              <div class="chat-empty-ic"><svg class="ic"><use href="#i-mic-off"/></svg></div>
              <b>Voice chat ended</b>
@@ -1141,31 +1330,102 @@
              <b>No messages yet</b>
              <span>${viewingLiveRoom() ? 'Say something in the group and it shows up here.' : `“${esc(state.chat.title || 'This group')}” has no messages yet.`}</span>
              ${otherLine}
-           </div>`;
+           </div>`);
       renderChat._first = true;
       return;
     }
 
     if (!list.length) {
       // There are group messages, but nobody in the call has spoken yet.
-      box.innerHTML = `<div class="sys"><svg class="ic"><use href="#i-lock"/></svg> Room chat · members in voice only</div>
+      chatReplace(box, `<div class="sys"><svg class="ic"><use href="#i-lock"/></svg> Room chat · members in voice only</div>
         ${hiddenBanner()}
         <div class="scope-note">
           <b>No messages from the voice chat yet</b>
           Only the ${vcIds().size} member${vcIds().size === 1 ? '' : 's'} in the call can post here.
           Tap <b style="display:inline;color:#9ccbff">Everyone</b> above to see the whole group chat.
-        </div>`;
+        </div>`);
       renderChat._first = true;
       return;
     }
 
-    box.innerHTML = `<div class="sys"><svg class="ic"><use href="#i-lock"/></svg> Messages are synced with the Telegram group</div>`
-      + hiddenBanner()
-      + rows;
-    if (nearBottom || renderChat._first === undefined) box.scrollTop = box.scrollHeight;
+    // Keyed, ordered reconciliation. Each top-level node carries a data-k;
+    // unchanged rows keep their exact DOM node (media keeps playing, Lottie
+    // keeps running, the active swipe transform stays put).
+    const desired = [
+      ['sys', `<div class="sys" data-k="sys"><svg class="ic"><use href="#i-lock"/></svg> Messages are synced with the Telegram group</div>`],
+    ];
+    const banner = hiddenBanner();
+    if (banner) desired.push(['banner', banner]);
+    for (const m of list) desired.push([`m:${String(m.id)}`, chatRowHTML(m)]);
+    const wanted = new Set(desired.map(([k]) => k));
+
+    const existing = new Map();
+    for (const el of Array.from(box.children)) {
+      if (el.dataset && el.dataset.k) existing.set(el.dataset.k, el);
+      else { destroyChatNode(el); el.remove(); }
+    }
+    for (const [k, el] of existing) {
+      if (!wanted.has(k)) { destroyChatNode(el); el.remove(); existing.delete(k); chatRows.delete(k); }
+    }
+
+    let i = 0;
+    let inserted = 0;
+    for (const [key, html] of desired) {
+      let el = existing.get(key);
+      const rec = chatRows.get(key);
+      if (el && rec && rec.html === html) {
+        // Byte-identical: keep the node and everything it owns.
+      } else {
+        const fresh = chatNode(html);
+        if (!fresh) { i++; continue; }
+        if (!fresh.dataset.k) fresh.dataset.k = key;
+        if (el) {
+          // A reaction only changes the row's chrome. Carry the live .tgs-box
+          // over so an animated sticker does not restart on every heart tap.
+          const oldT = el.querySelector('.tgs-box');
+          const newT = fresh.querySelector('.tgs-box');
+          if (oldT && newT && oldT.dataset.tgs === newT.dataset.tgs) newT.replaceWith(oldT);
+          else destroyChatNode(el);
+          box.replaceChild(fresh, el);
+        } else {
+          // Genuinely new row: a brief glow so a new message is noticeable
+          // even when the list is already scrolled to the bottom.
+          if (key.startsWith('m:')) inserted += 1;
+          if (!first && fresh.classList.contains('msg')) {
+            fresh.classList.add('is-new');
+            setTimeout(() => fresh.classList.remove('is-new'), 800);
+          }
+          box.insertBefore(fresh, box.children[i] || null);
+        }
+        el = fresh;
+        chatRows.set(key, { html, el: fresh });
+      }
+      const at = box.children[i];
+      if (at !== el) box.insertBefore(el, at || null);
+      i++;
+    }
+    // Anything left over is stale (e.g. rows hidden by the "in voice" filter).
+    while (box.children.length > desired.length) {
+      const el = box.lastElementChild;
+      destroyChatNode(el);
+      chatRows.delete(el.dataset?.k);
+      el.remove();
+    }
+    for (const k of Array.from(chatRows.keys())) if (!wanted.has(k)) chatRows.delete(k);
+
+    if (nearBottom || first) box.scrollTop = box.scrollHeight;
+    noteNewRows(inserted, nearBottom || first);
     wireImgFallbacks();
-    hydrateTgs(box);
+    hydrateTgs(box);   // only [data-tgs] nodes that are not done yet
     renderChat._first = true;
+  }
+
+  /// Full replacement for the empty states; also drops the keyed cache and any
+  /// running Lottie animations so nothing leaks across the transition.
+  function chatReplace(box, html) {
+    for (const el of Array.from(box.children)) destroyChatNode(el);
+    box.innerHTML = html;
+    chatRows.clear();
   }
 
   function waveBars(id) {
@@ -1204,9 +1464,17 @@
   function askConfirm(title, message, label = 'Delete') {
     return new Promise((resolve) => {
       let done = false;
-      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      let timer = 0;
+      const fallback = () => window.confirm(`${title}\n\n${message}`);
+      const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
       try {
-        if (tg?.showPopup) {
+        // showPopup needs WebApp 6.2+. Older clients expose the method but
+        // reject it at runtime and never invoke the callback, which used to
+        // leave destructive actions hanging forever.
+        const supported = !tg || typeof tg.isVersionAtLeast !== 'function'
+          || tg.isVersionAtLeast('6.2');
+        if (supported && typeof tg?.showPopup === 'function') {
+          timer = setTimeout(() => finish(fallback()), 6000);
           tg.showPopup({
             title,
             message,
@@ -1218,7 +1486,7 @@
           return;
         }
       } catch {}
-      finish(window.confirm(`${title}\n\n${message}`));
+      finish(fallback());
     });
   }
 
@@ -1275,12 +1543,14 @@
     if (id === String(state.chat.id)) { closeSocial(); return; }
     try {
       await api('/api/chat/select', { id });
+      // A send / reaction still in flight belongs to the *old* chat. Drop all
+      // of it before pulling the new timeline, or its bubble and the SSE echo
+      // would land in the wrong group.
+      resetChatTransient();
       // Pull the new chat's own timeline; the SSE frame for it would arrive on
       // the next tick anyway, but this makes the switch instant.
       const s = await api('/api/state');
       merge(s);
-      chatSig = sigOf(state.messages || []);
-      lastSig.chat = '';
       closeSocial();
       renderAll(true);
       scrollChat();
@@ -1309,10 +1579,9 @@
       if (Array.isArray(r.chats)) state.chats = r.chats;
       if (String(state.chat.id) === id) {
         // The chat being viewed was cleared or removed: reload the view.
+        resetChatTransient();
         const s = await api('/api/state');
         merge(s);
-        chatSig = sigOf(state.messages || []);
-        lastSig.chat = '';
         renderAll(true);
       } else {
         renderChatRows();
@@ -1335,9 +1604,8 @@
     if (!ok) return;
     try {
       await api('/api/chat/clear', {});
+      resetChatTransient();
       state.messages = [];
-      chatSig = '0';
-      lastSig.chat = '';
       renderChat(true);
       renderChatRows();
       toast('Chat cleared');
@@ -1347,21 +1615,50 @@
   }
 
   /* ────────────────────────── tabs ────────────────────────── */
+  const TAB_ORDER = ['song', 'chat', 'members', 'queue', 'profile'];
+  let leaveTimer = 0;
   function switchTab(tab) {
-    closeSocial();
+    const from = TAB_ORDER.indexOf(activeTab);
+    const to = TAB_ORDER.indexOf(tab);
+    if (to < 0) return;
+    // A tab jump (keyboard 1–5, mini player, mention…) used to leave the
+    // gear/…/invite/sleep sheets floating over the new view. Peel every
+    // layer first so a tab is always a clean slate.
+    closeAllOverlays();
+    // Direction-aware cross-fade: going right slides in from the right.
+    // `#content[data-nav]` selects the matching keyframe in CSS.
+    $('#content').dataset.nav = to >= from ? 'fwd' : 'back';
+    const ind = $('#tabInd');
+    if (ind) ind.style.setProperty('--tab-i', String(to));
+    const prev = $('.view.is-active');
+    $$('.view').forEach(v => v.classList.toggle('is-active', v.dataset.view === tab));
+    // Keep the outgoing view painted for one frame so it fades out instead
+    // of vanishing instantly; reduced-motion/lite CSS collapses this to 0.
+    if (prev && prev.dataset.view !== tab) {
+      clearTimeout(leaveTimer);
+      $$('.view.is-leaving').forEach(v => v.classList.remove('is-leaving'));
+      prev.classList.add('is-leaving');
+      leaveTimer = setTimeout(() => prev.classList.remove('is-leaving'), 260);
+    }
     activeTab = tab;
     $('#app').dataset.tab = tab;
     $('#screen').dataset.tab = tab;
     $$('.tab').forEach(b => b.classList.toggle('is-active', b.dataset.tab === tab));
-    $$('.view').forEach(v => v.classList.toggle('is-active', v.dataset.view === tab));
-    if (tab !== 'chat') $('#stickerPanel').classList.remove('is-on');
+    if (tab !== 'chat') {
+      $('#stickerPanel').classList.remove('is-on');
+      $('#btnSticker').classList.remove('is-on');
+    }
     if (tab === 'chat') {
       unread = 0;
       paintUnread();
       markRead();
       const box = $('#msgs');
       requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
+      updateJump();
     }
+    // No overlay class changed when nothing was open, so the observer would
+    // not fire: resync the native BackButton explicitly on every tab jump.
+    syncChrome();
     haptic('light');
   }
 
@@ -1462,15 +1759,47 @@
     updateSendState();
   }
 
+  /// Reconcile one confirmed/failed optimistic send, whichever arrived first:
+  /// the HTTP reply or an SSE frame carrying the same `clientId`.
+  function settleSend(clientId, serverMsg) {
+    const p = pendingMsgs.get(clientId);
+    pendingMsgs.delete(clientId);
+    // The viewer switched chats while this request was in flight: the
+    // optimistic bubble is gone with the old timeline and the echo belongs to
+    // that other chat. Never inject it into the current one.
+    if (p && p.chat !== chatKey()) return;
+    // No pending record means an SSE frame already reconciled the echo (or the
+    // chat was reset). state.messages is already authoritative in both cases.
+    if (!p) { renderChat(true); return; }
+    const i = state.messages.findIndex(m => String(m.clientId ?? '') === String(clientId));
+    if (serverMsg) {
+      const merged = { ...(i >= 0 ? state.messages[i] : {}), ...serverMsg, mine: true };
+      if (i >= 0) state.messages[i] = merged;
+      else state.messages.push(merged);
+    } else if (i >= 0) {
+      state.messages.splice(i, 1);
+    }
+    chatSig = sigOf(state.messages);
+    renderChat(true);
+  }
+
+  /// In-flight guard: a double tap on Send used to post the same text twice
+  /// because the composer was cleared before the first request settled.
+  let textSending = false;
   async function sendText() {
     if (!chatLive()) { toast('Voice chat ended — chat is cleared'); return; }
+    if (textSending) return;
     const { text, entities } = readComposer();
     if (!text.trim()) return;
     const reply = replyTarget;
+    // Keep the rich DOM (premium emoji spans) so a failed send restores the
+    // exact composer contents instead of flattening them to plain text.
+    const draft = editor().innerHTML;
     clearComposer();
     cancelReply();
+    const clientId = `c${Date.now()}${Math.floor(Math.random() * 1e4)}`;
     const local = {
-      id: `l${Date.now()}`,
+      id: clientId, clientId,
       mid: 0,
       from: viewer.id,
       name: viewer.name,
@@ -1483,35 +1812,35 @@
       ts: nowStamp(),
       reply: reply ? { name: reply.name, text: reply.text } : null,
     };
+    const chat = chatKey();
+    pendingMsgs.set(clientId, { msg: local, at: Date.now(), clientId, chat });
     state.messages.push(local);
     chatSig = sigOf(state.messages);
-    renderChat();
+    renderChat(true);
     scrollChat();
     haptic('light');
+    textSending = true;
     try {
       const res = await api('/api/chat/send', {
-        kind: 'text', text, entities,
+        kind: 'text', text, entities, clientId,
         replyTo: reply?.mid || 0,
         senderId: viewer.id, senderName: viewer.name, tags: myTags(),
       });
-      if (res.message) {
-        const i = state.messages.findIndex(m => m.id === local.id);
-        if (i >= 0) state.messages[i] = { ...res.message, mine: true };
-        chatSig = sigOf(state.messages);
-        renderChat();
-      }
+      settleSend(clientId, res.message || null);
     } catch (e) {
-      const i = state.messages.findIndex(m => m.id === local.id);
-      if (i >= 0) state.messages.splice(i, 1);
-      renderChat();
-      editor().textContent = text;
+      settleSend(clientId, null);
+      editor().innerHTML = draft;
       updateSendState();
       toast(`Send failed: ${e.message}`);
+    } finally {
+      textSending = false;
+      emitSendDone();
     }
   }
 
   async function sendSticker(s, thumb) {
     if (!chatLive()) { toast('Voice chat ended — chat is cleared'); return; }
+    if (stickerSending || !s) return;
     // Use the sticker document itself, not its static thumbnail: the Bot API
     // proxy answers with WebP / WebM / gzip `.tgs`, and media_kind tells the
     // bubble which renderer to use.
@@ -1522,40 +1851,66 @@
     const media = s.file_id
       ? `/api/tgimg?fid=${encodeURIComponent(s.file_id)}`
       : (thumb || s.thumb || s.media);
+    const clientId = `c${Date.now()}${Math.floor(Math.random() * 1e4)}`;
     const local = {
-      id: `l${Date.now()}`, mid: 0, from: viewer.id, name: viewer.name, photo: viewer.photo,
+      id: clientId, clientId, mid: 0, from: viewer.id, name: viewer.name, photo: viewer.photo,
       tags: myTags(), mine: true, kind: 'sticker', text: '', emoji: s.emoji,
       media, media_kind: kind, ts: nowStamp(),
     };
+    const chat = chatKey();
+    pendingMsgs.set(clientId, { msg: local, at: Date.now(), clientId, chat });
     state.messages.push(local);
     chatSig = sigOf(state.messages);
-    renderChat();
+    renderChat(true);
     scrollChat();
     haptic('medium');
     $('#stickerPanel').classList.remove('is-on');
+    $('#btnSticker').classList.remove('is-on');
+    stickerSending = true;
     try {
       const res = await api('/api/chat/send', {
         kind: 'sticker', sticker: s.file_id || '', thumb: thumb || s.thumb || s.media,
-        emoji: s.emoji, media, media_kind: kind, mediaKey: s.mediaKey || '',
+        emoji: s.emoji, media, media_kind: kind, mediaKey: s.mediaKey || '', clientId,
         senderId: viewer.id, senderName: viewer.name, tags: myTags(),
       });
-      if (res.message) {
-        const i = state.messages.findIndex(m => m.id === local.id);
-        if (i >= 0) state.messages[i] = { ...res.message, media, media_kind: kind, mine: true };
-        chatSig = sigOf(state.messages);
-        renderChat();
-      }
+      // Keep the locally-chosen media: the bridge echoes only a thumbnail.
+      settleSend(clientId, res.message ? { ...res.message, media, media_kind: kind } : null);
     } catch (e) {
+      // A failed sticker send used to leave a permanent ghost bubble (mid 0,
+      // impossible to delete because it never reached Telegram). Roll it back.
+      settleSend(clientId, null);
       toast(`Sticker failed: ${e.message}`);
+    } finally {
+      stickerSending = false;
+      emitSendDone();
     }
   }
 
   async function react(m, emoji = '❤️') {
     if (!m || !m.mid) return;
+    const prev = m.reacted || '';
+    const key = String(m.mid);
+    const chat = chatKey();
+    pendingReacts.set(key, { emoji, at: Date.now(), chat });
     m.reacted = emoji;
-    renderChat();
+    chatSig = sigOf(state.messages);
+    renderChat(true);
     haptic('medium');
-    try { await api('/api/chat/react', { mid: m.mid, emoji }); } catch {}
+    try {
+      await api('/api/chat/react', { mid: m.mid, emoji });
+      // The server now persists `reacted`, so the next frame agrees with us.
+    } catch (e) {
+      const r = pendingReacts.get(key);
+      pendingReacts.delete(key);
+      // A chat switch already replaced the timeline; the stale message object
+      // is no longer on screen and must not be mutated back.
+      if (r && r.chat !== chatKey()) { toast(`Reaction failed: ${e.message}`); return; }
+      m.reacted = prev || undefined;
+      if (!prev) delete m.reacted;
+      chatSig = sigOf(state.messages);
+      renderChat(true);
+      toast(`Reaction failed: ${e.message}`);
+    }
   }
 
   function scrollChat() {
@@ -1588,6 +1943,12 @@
   }
 
   async function renderPane() {
+    // Every call invalidates any in-flight render. Rapid pack/pane switching
+    // used to let an older, slower /api/stickers response overwrite the newer
+    // grid. A generation counter plus caching the *promise* (not the resolved
+    // value) fixes both the stale write and the duplicate request.
+    const gen = ++paneGen;
+    clearSavedHold();
     $$('.sticker-tab').forEach(t => t.classList.toggle('is-on', t.dataset.pane === pane));
     const packRow = $('#stickerPacks');
     const grid = $('#stickerGrid');
@@ -1624,49 +1985,67 @@
     if (!packs) {
       packRow.hidden = true;
       grid.classList.remove('packs');
+      grid.dataset.set = '';
       grid.innerHTML = EMOJI.map(e => `<button class="sticker-cell emoji-cell" data-emoji="${esc(e)}">${e}</button>`).join('');
       return;
     }
 
     packRow.hidden = false;
     if (!packs.includes(packName)) packName = packs[0];
+    const wantPack = packName;
+    const wantPremium = pane === 'premium';
     packRow.innerHTML = packs.map(p =>
-      `<button class="pack-chip ${p === packName ? 'is-on' : ''}" data-pack="${esc(p)}">${esc(p)}</button>`).join('');
+      `<button class="pack-chip ${p === wantPack ? 'is-on' : ''}" data-pack="${esc(p)}">${esc(p)}</button>`).join('');
     grid.classList.add('packs');
+    grid.dataset.set = wantPack;
     grid.innerHTML = '<div class="sticker-cell loading"></div>'.repeat(10);
 
     let set;
     try {
-      set = packCache[packName] || (packCache[packName] = await api(`/api/stickers?set=${encodeURIComponent(packName)}`));
+      if (!packCache[wantPack]) {
+        // Cache the in-flight promise so two quick taps on the same chip issue
+        // exactly one request. On failure drop it so a retry really refetches.
+        packCache[wantPack] = api(`/api/stickers?set=${encodeURIComponent(wantPack)}`)
+          .catch((e) => { delete packCache[wantPack]; throw e; });
+      }
+      set = await packCache[wantPack];
     } catch {
-      grid.innerHTML = `<div class="no-results" style="grid-column:1/-1">Couldn't load ${esc(packName)}</div>`;
+      if (gen !== paneGen) return;
+      grid.innerHTML = `<div class="no-results" style="grid-column:1/-1">
+          Couldn't load ${esc(wantPack)}
+          <button class="ghost-circle" data-retry-pack="${esc(wantPack)}" style="margin-left:8px">Retry</button>
+        </div>`;
       return;
     }
-    if (!set.stickers?.length) {
+    if (gen !== paneGen) return;               // a newer pane/pack won
+    if (!set || !Array.isArray(set.stickers) || !set.stickers.length) {
       grid.innerHTML = '<div class="no-results" style="grid-column:1/-1">Empty pack</div>';
       return;
     }
-    grid.innerHTML = set.stickers.map((s, i) => pane === 'premium'
-      ? `<button class="sticker-cell emoji-cell" data-prem="${i}" title="${esc(s.emoji)}"><img src="${esc(s.thumb)}" loading="lazy" alt="${esc(s.emoji)}" /></button>`
-      : `<button class="sticker-cell" data-sticker="${i}" title="${esc(s.emoji)}"><img src="${esc(s.thumb)}" loading="lazy" alt="${esc(s.emoji)}" /></button>`
+    packData[wantPack] = set;
+    grid.innerHTML = set.stickers.map((s, i) => wantPremium
+      ? `<button class="sticker-cell emoji-cell" data-prem="${i}" title="${esc(s.emoji || '')}"><img src="${esc(s.thumb || '')}" loading="lazy" alt="${esc(s.emoji || '')}" /></button>`
+      : `<button class="sticker-cell" data-sticker="${i}" title="${esc(s.emoji || '')}"><img src="${esc(s.thumb || '')}" loading="lazy" alt="${esc(s.emoji || '')}" /></button>`
     ).join('');
-    grid.dataset.set = packName;
+    grid.dataset.set = wantPack;
   }
 
   /* ────────────────────────── search ────────────────────────── */
   const TRENDING = ['khat', 'arijit singh', 'lofi beats', 'navjot ahuja', 'punjabi hits', '@stalker'];
 
   function openSearch() {
+    // Search is a full-screen panel rendered *below* the scrim. If a bottom
+    // sheet were still open the scrim would grey out the search UI, so make
+    // the keyboard "/" shortcut and the top-bar button mutually exclusive
+    // with every other layer.
+    closeAllOverlays();
     $('#searchOverlay').classList.add('is-open');
     renderTrending();
     setTimeout(() => $('#searchInput').focus(), 240);
-    tg?.BackButton?.show?.();
-    tg?.BackButton?.onClick?.(closeSearch);
   }
   function closeSearch() {
     $('#searchOverlay').classList.remove('is-open');
     $('#searchInput').blur();
-    tg?.BackButton?.hide?.();
   }
 
   function renderTrending() {
@@ -2169,7 +2548,14 @@
       <button class="sheet-row" data-set-act="bot">
         <span class="lbl">Open bot in Telegram<div class="hint">Commands, help and support</div></span>
         <svg class="ic" style="width:14px;height:14px;color:#55565c"><use href="#i-external"/></svg>
-      </button>`;
+      </button>
+      <button class="sheet-row" data-set-act="exit">
+        <span class="lbl">Exit / close app<div class="hint">Leave the Mini App · playback keeps running</div></span>
+        <svg class="ic" style="width:14px;height:14px;color:#55565c"><use href="#i-exit"/></svg>
+      </button>
+      <div class="sheet-foot" id="settingsFoot">
+        Parvati Music · shortcuts: <b>Esc</b> back · <b>/</b> search · <b>1–5</b> tabs · <b>?</b> help
+      </div>`;
     $('#settingsRows').innerHTML = toggles + local;
   }
 
@@ -2191,6 +2577,7 @@
         ? moreRow('end', 'End voice chat', 'Stop playback and leave the call', 'i-x', true)
         : `<div class="sheet-row"><span class="lbl">Voice chat<div class="hint">No active session — send /play in the group</div></span><span class="tag member">ended</span></div>`,
       canManage() ? moreRow('leave', 'Leave group', 'Bot leaves this group · its chat is removed here', 'i-external', true) : '',
+      moreRow('exit', 'Exit / close app', 'Leave the Mini App or go back to the bot', 'i-exit'),
     ].join('');
     $('#moreRows').innerHTML = rows;
   }
@@ -2226,11 +2613,14 @@
     toast('Refreshing chat…');
     try {
       const r = await api('/api/chat/refresh', {});
-      if (Array.isArray(r.messages)) { state.messages = r.messages; chatSig = sigOf(r.messages); }
-      if (Array.isArray(r.chats)) state.chats = r.chats;
+      // A hard re-read of the mirror: drop optimistic bubbles/reactions and
+      // the keyed DOM cache so the server timeline is authoritative again.
+      resetChatTransient();
+      renderChat._first = true;          // keep the reader's scroll position
       if (r.chat) state.chat = { ...state.chat, ...r.chat };
+      if (Array.isArray(r.chats)) state.chats = r.chats;
       if (r.state) merge(r.state);
-      lastSig.chat = '';
+      if (Array.isArray(r.messages)) mergeMessages(r.messages);
       closeSheet();
       renderAll(true);
       renderChatRows();
@@ -2252,10 +2642,9 @@
       const r = await api('/api/chat/leave', {});
       if (Array.isArray(r.chats)) state.chats = r.chats;
       closeSheet();
+      resetChatTransient();
       const s = await api('/api/state');
       merge(s);
-      chatSig = sigOf(state.messages || []);
-      lastSig.chat = '';
       renderAll(true);
       renderChatRows();
       toast(r.left ? 'Left the group' : 'Chat removed from the app');
@@ -2270,8 +2659,8 @@
       const r = await api('/api/session/end', { id: viewer?.id, name: viewer?.name });
       state.members = state.members.map(m => ({ ...m, vc: false }));
       state.playback = { ...state.playback, track: null, playing: false, paused: true, position: 0, queue: [] };
+      resetChatTransient();
       state.messages = [];
-      chatSig = '0';
       merge({ room: { live: false, online: 0 }, session: r.session });
       closeSheet();
       renderAll();
@@ -2302,7 +2691,7 @@
   }
 
   /* ─────────────────── social: shared overlays ─────────────────── */
-  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet', '#bannedSheet'];
+  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet', '#bannedSheet', '#exitSheet'];
 
   function closeSocial() {
     SOCIAL_SHEETS.forEach(s => { const el = $(s); if (el) el.classList.remove('is-open'); });
@@ -2310,20 +2699,29 @@
   }
 
   function openSocial(sel) {
-    // Only one overlay at a time. Closing the others clears the shared scrim,
-    // which is put straight back under the freshly opened sheet.
-    closeCtx(); closeSheet(); closeInvite(); closePick(); closeSocial();
+    // Only one layer at a time. The old cleanup list missed search and DM,
+    // so a social sheet could open on top of them and the scrim would then
+    // dim the search UI (z24 > z20). One shared helper covers all ~17.
+    closeAllOverlays();
     $(sel).classList.add('is-open');
     $('#scrim').classList.add('is-on');
   }
 
   async function loadSavedStickers() {
     if (!online || !viewer?.id) return;
+    // Opening the Saved tab and boot can both trigger this. Only the newest
+    // response may win, or a slow stale read repaints an outdated list.
+    const seq = ++savedSeq;
+    const me = String(viewer.id);
     try {
-      const r = await api(`/api/stickers/saved?me=${encodeURIComponent(viewer.id)}`);
-      social.savedStickers = r.stickers || [];
+      const r = await api(`/api/stickers/saved?me=${encodeURIComponent(me)}`, undefined, 12000);
+      if (seq !== savedSeq) return;
+      social.savedStickers = Array.isArray(r.stickers) ? r.stickers : [];
       if (pane === 'saved') renderPane();
-    } catch { social.savedStickers = []; }
+    } catch {
+      // A transient read failure must not wipe the list we already show.
+      if (seq !== savedSeq) return;
+    }
   }
 
   /* ─────────────────── user profile card ─────────────────── */
@@ -2623,6 +3021,41 @@
       if (hint) hint.style.opacity = '';
     };
 
+    /// One place that ends a gesture and applies any chat frame that was held
+    /// back while the finger was down. Without this a dropped pointerup could
+    /// leave gestureActive true forever and freeze the chat repaint.
+    const finish = (cur, consumed, spring = false) => {
+      if (g === cur) g = null;
+      else return;
+      clearTimeout(cur.timer);
+      if (cur.raf) cancelAnimationFrame(cur.raf);
+      if (cur.watchdog) clearTimeout(cur.watchdog);
+      if (cur.active) {
+        if (spring) {
+          // Let CSS animate the row back to rest instead of snapping.
+          cur.el.classList.remove('is-swiping');
+          cur.el.classList.add('is-settling');
+          cur.el.style.transform = '';
+          const hint = cur.el.querySelector('.swipe-hint');
+          if (hint) hint.style.opacity = '';
+          setTimeout(() => cur.el && cur.el.classList.remove('is-settling'), 280);
+        } else {
+          settle(cur.el);
+        }
+      }
+      gestureActive = false;
+      if (consumed) {
+        suppressUntil = Date.now() + 450;
+        suppressId = String(cur.m.id ?? '');
+        lastTap = { id: '', at: 0 };
+      }
+      if (chatRenderDeferred) {
+        chatRenderDeferred = false;
+        // Let the pointer event finish before touching the DOM.
+        requestAnimationFrame(() => renderChat(true));
+      }
+    };
+
     box.addEventListener('pointerdown', (e) => {
       const el = e.target.closest('.msg');
       if (!el || e.button === 2) return;
@@ -2630,62 +3063,85 @@
       if (e.target.closest('a, .sticker-save, .react-chip, .reply, .msg-av, .msg-head b')) return;
       const m = state.messages.find(x => String(x.id) === el.dataset.id);
       if (!m) return;
-      g = { id: e.pointerId, el, m, x0: e.clientX, y0: e.clientY, dx: 0, active: false, timer: null };
+      // A second finger/pen must not silently overwrite the first gesture and
+      // leave its long-press timer running (which opened a stray menu later).
+      if (g) { finish(g, g.active); }
+      g = { id: e.pointerId, el, m, x0: e.clientX, y0: e.clientY, dx: 0,
+            active: false, timer: null, raf: 0, watchdog: null };
       g.timer = setTimeout(() => {
-        if (!g || g.active) return;
         const cur = g;
-        g = null;
-        clearTimeout(cur.timer);
-        suppressUntil = Date.now() + 500;   // swallow the click that follows
+        if (!cur || cur.active || cur.id !== e.pointerId) return;
+        // Long press: consume the trailing click, then open the message menu.
+        suppressUntil = Date.now() + 500;
+        suppressId = String(cur.m.id ?? '');
         lastTap = { id: '', at: 0 };
+        finish(cur, false);
         haptic('medium');
         openMsgMenu(cur.m);
       }, 470);
+      // Watchdog: if the browser never delivers pointerup/cancel (tab hidden,
+      // OS gesture, lost capture), do not keep the chat frozen indefinitely.
+      g.watchdog = setTimeout(() => { if (g) finish(g, g.active); }, 1600);
     });
 
     box.addEventListener('pointermove', (e) => {
       if (!g || e.pointerId !== g.id) return;
+      // A node detached by a render makes the whole gesture meaningless.
+      if (!g.el.isConnected) { finish(g, g.active); return; }
       const dx = e.clientX - g.x0;
       const dy = e.clientY - g.y0;
       if (!g.active) {
-        if (Math.abs(dx) < 12) return;
-        if (Math.abs(dx) < Math.abs(dy) * 1.2) {   // vertical scroll — let it be
-          clearTimeout(g.timer); g = null; return;
+        // Any real movement cancels the long press, even below the swipe
+        // threshold: a scrolling finger must never open the action menu.
+        if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+        clearTimeout(g.timer);
+        // A real swipe often starts with 8-10 px steps. Ending the gesture on
+        // the first sub-threshold move made swipe-to-reply fail on slow
+        // fingers; keep waiting until the horizontal travel is decisive.
+        if (Math.abs(dx) < 12) {
+          if (Math.abs(dy) > Math.abs(dx)) finish(g, false); // clearly a scroll
+          return;
+        }
+        if (Math.abs(dx) < Math.abs(dy) * 1.2) {
+          finish(g, false);                  // vertical dominance — let it be
+          return;
         }
         g.active = true;
-        clearTimeout(g.timer);
+        gestureActive = true;                // defer chat renders mid-swipe
         try { g.el.setPointerCapture(e.pointerId); } catch {}
         g.el.classList.add('is-swiping');
         const hint = g.el.querySelector('.swipe-hint');
         if (hint) hint.style.opacity = '1';
       }
       g.dx = clamp(dx, 0, 84);
-      g.el.style.transform = `translateX(${g.dx}px)`;
+      // Batch transform writes into one animation frame instead of forcing a
+      // layout on every pointermove event.
+      const el = g.el, x = g.dx;
+      if (g.raf) cancelAnimationFrame(g.raf);
+      g.raf = requestAnimationFrame(() => {
+        if (el.isConnected) el.style.transform = `translateX(${x}px)`;
+      });
     });
 
     const end = (e) => {
       if (!g || e.pointerId !== g.id) return;
-      clearTimeout(g.timer);
       const cur = g;
-      g = null;
-      if (!cur.active) return;                     // plain tap → click handler
-      const fired = cur.dx > 54;
-      cur.el.classList.remove('is-swiping');
-      cur.el.classList.add('is-settling');
-      cur.el.style.transform = '';
-      const hint = cur.el.querySelector('.swipe-hint');
-      if (hint) hint.style.opacity = '';
-      setTimeout(() => cur.el && cur.el.classList.remove('is-settling'), 280);
-      suppressUntil = Date.now() + 450;           // swallow the trailing click
-      lastTap = { id: '', at: 0 };
+      const fired = cur.active && cur.dx > 54;
+      finish(cur, cur.active, cur.active);
       if (fired) { haptic('light'); setReply(cur.m); }
     };
     box.addEventListener('pointerup', end);
     box.addEventListener('pointercancel', (e) => {
-      if (!g || e.pointerId !== g.id) return;
-      clearTimeout(g.timer);
-      settle(g.el);
-      g = null;
+      if (g && e.pointerId === g.id) finish(g, g.active);
+    });
+    // Capture can be lost without a pointercancel (e.g. the OS takes over the
+    // touch, or the node is reparented). Settle instead of leaving a stuck row.
+    box.addEventListener('lostpointercapture', (e) => {
+      if (g && e.pointerId === g.id) finish(g, g.active);
+    });
+    // Mouse/pen leaving the list while still down should not keep a timer.
+    box.addEventListener('pointerleave', (e) => {
+      if (g && e.pointerId === g.id && e.pointerType !== 'touch') finish(g, g.active);
     });
     box.addEventListener('contextmenu', (e) => {
       if (e.target.closest('.msg')) e.preventDefault();
@@ -2697,6 +3153,327 @@
       if (e.target.closest('.msg')) e.preventDefault();
     }, true);
   }
+
+  /* ─────────────── polish: motion, tap feedback, exit, status ───────────────
+   * One cohesive layer for the small details: connection status, jump-to-
+   * latest, a unified back stack (so BackButton / Esc / scrim always dismiss
+   * exactly one layer), ripples, drag-to-dismiss sheets, and a real exit
+   * option. Everything is guarded for fx-lite / reduced motion. */
+  const OVERLAY_SELECTORS = [
+    '#exitSheet', '#searchOverlay', '#profileSheet', '#msgMenu', '#stickerSheet',
+    '#forwardSheet', '#chatsSheet', '#bannedSheet', '#inviteSheet', '#sleepSheet',
+    '#pickSheet', '#settingsSheet', '#moreSheet', '#dmSheet', '#ctxMenu',
+  ];
+  // The sticker panel and reply bar are inline popovers inside the chat view,
+  // not full overlays, but they still belong on the back stack: BackButton /
+  // Esc must dismiss them *before* leaving the tab. They use `is-on` rather
+  // than `is-open`, so they need their own check.
+  const INLINE_LAYERS = ['#stickerPanel', '#replyBar'];
+  const CHROME_SELECTORS = [...OVERLAY_SELECTORS, ...INLINE_LAYERS];
+  const layerOpen = (el) => !!el
+    && (el.classList.contains('is-open') || el.classList.contains('is-on'));
+  const anyOverlay = () => CHROME_SELECTORS.some(sel => layerOpen($(sel)));
+  const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches
+    || document.documentElement.classList.contains('fx-lite');
+
+  /* ── connection status ── */
+  function setNet(kind, text) {
+    const el = $('#netBar');
+    if (!el) return;
+    clearTimeout(setNet._t);
+    if (!kind) { el.classList.remove('is-on'); el.hidden = true; return; }
+    el.hidden = false;
+    el.dataset.kind = kind;
+    $('#netText').textContent = text;
+    requestAnimationFrame(() => el.classList.add('is-on'));
+    if (kind === 'ok') setNet._t = setTimeout(() => setNet(null), 1700);
+  }
+
+  /* ── jump-to-latest floating pill ── */
+  let jumpNew = 0;
+  function updateJump() {
+    const box = $('#msgs'), btn = $('#jumpLatest');
+    if (!box || !btn) return;
+    const away = box.scrollHeight - box.scrollTop - box.clientHeight > 140;
+    const show = activeTab === 'chat' && (away || jumpNew > 0);
+    btn.classList.toggle('is-on', show);
+    const cnt = $('#jumpCount');
+    if (jumpNew > 0) {
+      cnt.textContent = jumpNew > 99 ? '99+' : String(jumpNew);
+      cnt.hidden = false;
+      $('#jumpLatestText').textContent = 'New';
+    } else {
+      cnt.hidden = true;
+      $('#jumpLatestText').textContent = 'Latest';
+    }
+  }
+  function noteNewRows(n, atBottom) {
+    if (atBottom) { jumpNew = 0; updateJump(); return; }
+    if (!n || activeTab !== 'chat') return;
+    const box = $('#msgs');
+    if (box.scrollHeight - box.scrollTop - box.clientHeight > 140) jumpNew += n;
+    updateJump();
+  }
+
+  /* ── exit option ── */
+  function openExit() {
+    closeAllOverlays();
+    $('#exitSub').textContent = tg
+      ? "You can reopen it any time from the bot's menu button."
+      : 'You can safely close this browser tab and come back later.';
+    openSocial('#exitSheet');
+    haptic('light');
+  }
+  function closeExit() {
+    $('#exitSheet').classList.remove('is-open');
+    $('#scrim').classList.remove('is-on');
+  }
+
+  function showExitCurtain() {
+    if ($('#exitCurtain')) return;
+    const el = document.createElement('div');
+    el.id = 'exitCurtain';
+    el.className = 'exit-curtain';
+    el.innerHTML = `<div class="exit-curtain-card">
+        <span class="exit-curtain-ic"><svg class="ic"><use href="#i-check-circle"/></svg></span>
+        <b>App closed</b>
+        <span>Playback in the voice chat keeps running. You can close this tab, or come back.</span>
+        <button class="primary-pill" id="exitReopen">Reopen Parvati Music</button>
+      </div>`;
+    document.body.appendChild(el);
+    $('#exitReopen').addEventListener('click', () => {
+      el.classList.add('is-out');
+      setTimeout(() => el.remove(), 280);
+    });
+  }
+  function doExit() {
+    closeAllOverlays();
+    haptic('medium');
+    try { tg?.close?.(); } catch {}
+    try { window.close?.(); } catch {}
+    // In a browser preview neither call is allowed; show a graceful state
+    // instead of leaving a dead screen.
+    setTimeout(() => {
+      if (!document.hidden && !$('#exitCurtain')) showExitCurtain();
+    }, 260);
+  }
+
+  /* ── unified back stack ──
+   * Telegram's BackButton, the scrim and Esc all go through closeTopmost(),
+   * so a back press peels off one layer instead of nuking every overlay and
+   * the chat scope at once. */
+  function closeTopmost() {
+    const layers = [
+      ['#exitSheet', closeExit],
+      ['#searchOverlay', closeSearch],
+      ['#forwardSheet', closeSocial], ['#stickerSheet', closeSocial],
+      ['#msgMenu', closeSocial], ['#profileSheet', closeSocial],
+      ['#chatsSheet', closeSocial], ['#bannedSheet', closeSocial],
+      ['#ctxMenu', closeCtx], ['#dmSheet', closeDm],
+      ['#pickSheet', closePick], ['#inviteSheet', closeInvite],
+      ['#sleepSheet', () => $('#sleepSheet').classList.remove('is-open')],
+      ['#settingsSheet', closeSheet], ['#moreSheet', closeSheet],
+      ['#stickerPanel', () => { $('#stickerPanel').classList.remove('is-on'); $('#btnSticker').classList.remove('is-on'); }],
+      ['#replyBar', cancelReply],
+    ];
+    for (const [sel, fn] of layers) {
+      const el = $(sel);
+      if (el && (el.classList.contains('is-open') || el.classList.contains('is-on'))) {
+        fn();
+        return true;
+      }
+    }
+    return false;
+  }
+  function closeAllOverlays() {
+    // One more iteration than the number of layers guarantees termination
+    // even if several overlays were somehow left open at once.
+    for (let i = 0; i < CHROME_SELECTORS.length + 2 && closeTopmost(); i++) { /* peel */ }
+  }
+  function handleBack() {
+    if (closeTopmost()) { haptic('light'); return; }
+    if (activeTab !== 'song') { switchTab('song'); return; }
+    openExit();
+  }
+  function syncBackButton() {
+    const b = tg?.BackButton;
+    if (!b) return;
+    const show = anyOverlay() || activeTab !== 'song';
+    try { show ? b.show?.() : b.hide?.(); } catch {}
+  }
+
+  /* ── chrome sync via MutationObserver ──
+   * Watches only the overlays themselves, so every existing open/close path
+   * (there are ~20) automatically drives the app recede, the scrim and the
+   * native BackButton without editing each one. */
+  function syncChrome() {
+    const anySheet = !!$('#screen').querySelector('.sheet.is-open');
+    $('#screen').classList.toggle('sheet-open', anySheet);
+    // Only bottom sheets and the context menu need the dim layer. Search is a
+    // full-screen panel that sits *below* the scrim (z20 vs z24), so dimming
+    // it would grey out the search UI; DM sits above it and needs no dim.
+    const anyDim = anySheet || layerOpen($('#ctxMenu'));
+    $('#scrim').classList.toggle('is-on', anyDim);
+    syncBackButton();
+  }
+  function wireChromeObserver() {
+    const obs = new MutationObserver(() => syncChrome());
+    for (const sel of CHROME_SELECTORS) {
+      const el = $(sel);
+      if (el) obs.observe(el, { attributes: true, attributeFilter: ['class'] });
+    }
+    syncChrome();
+  }
+
+  /* ── global ripple ── */
+  const RIPPLE_SEL = '.round-btn, .round-mini, .tab, .sheet-row, .chat-row, .result, .chip, ' +
+    '.sticker-cell, .pack-chip, .seg-btn, .sleep-opt, .sticker-tab, .pill-icon, ' +
+    '.ghost-circle, .unban-btn, .primary-pill, .pill-send, .clear-btn, .room-pill, .chat-switch';
+  function wireRipple() {
+    $('#screen').addEventListener('pointerdown', (e) => {
+      if (e.button === 2 || reduceMotion()) return;
+      if (e.target.closest('.msg, .chat-input, input, .seek, .no-ripple')) return;
+      const host = e.target.closest(RIPPLE_SEL);
+      if (!host) return;
+      const r = host.getBoundingClientRect();
+      const size = Math.max(r.width, r.height) * 1.1;
+      const ink = document.createElement('span');
+      ink.className = 'ripple';
+      ink.style.width = ink.style.height = `${size}px`;
+      ink.style.left = `${e.clientX - r.left}px`;
+      ink.style.top = `${e.clientY - r.top}px`;
+      ink.addEventListener('animationend', () => ink.remove());
+      if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+      host.appendChild(ink);
+      setTimeout(() => ink.remove(), 650);
+    }, true);
+  }
+
+  /* ── drag any sheet down to dismiss ── */
+  function wireSheetDrag() {
+    $$('.sheet').forEach(sheet => {
+      let drag = null;
+      sheet.addEventListener('pointerdown', (e) => {
+        if (!sheet.classList.contains('is-open') || e.button === 2) return;
+        const top = sheet.getBoundingClientRect().top;
+        if (e.clientY - top > 46 && !e.target.closest('.sheet-grab')) return;
+        if (e.target.closest('button, input, a, .switch, [contenteditable]')) return;
+        drag = { id: e.pointerId, y0: e.clientY, dy: 0, t0: Date.now() };
+        sheet.classList.add('is-dragging');
+        try { sheet.setPointerCapture(e.pointerId); } catch {}
+      });
+      sheet.addEventListener('pointermove', (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        drag.dy = Math.max(0, e.clientY - drag.y0);
+        sheet.style.setProperty('--drag', `${drag.dy}px`);
+        $('#scrim').style.opacity = String(Math.max(0.15, 1 - drag.dy / 420));
+      });
+      const end = (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        const { dy, t0 } = drag;
+        drag = null;
+        sheet.classList.remove('is-dragging');
+        $('#scrim').style.removeProperty('opacity');
+        const fast = Date.now() - t0 < 260 && dy > 40;
+        if (dy > 92 || fast) {
+          haptic('light');
+          // Close *this* sheet, not whichever layer the stack happens to
+          // consider topmost. Keep --drag until the close transition has
+          // started, otherwise the sheet snaps back to 0 before sliding out.
+          sheet.classList.remove('is-open');
+          syncChrome();
+          requestAnimationFrame(() => sheet.style.removeProperty('--drag'));
+        } else {
+          sheet.style.removeProperty('--drag');
+        }
+      };
+      sheet.addEventListener('pointerup', end);
+      sheet.addEventListener('pointercancel', end);
+    });
+  }
+
+  /* ── boot the polish layer ── */
+  function wirePolish() {
+    wireChromeObserver();
+    wireRipple();
+    wireSheetDrag();
+
+    // Native back button is a single global handler; openSearch/closeSearch
+    // must not overwrite it with their own callback anymore.
+    try { tg?.BackButton?.onClick?.(handleBack); } catch {}
+    try { tg?.enableClosingConfirmation?.(); } catch {}
+
+    $('#btnExit').addEventListener('click', openExit);
+    $('#exitSheet').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-exit]');
+      if (!b) return;
+      haptic('light');
+      const act = b.dataset.exit;
+      if (act === 'stay') closeExit();
+      else if (act === 'bot') { closeExit(); $('#btnOpenBot').click(); }
+      else if (act === 'close') doExit();
+    });
+
+    // Toast: tap anywhere to dismiss (the action button has its own handler).
+    $('#toast').addEventListener('click', (e) => {
+      if (!e.target.closest('#toastAct')) dismissToast();
+    });
+
+    // Jump-to-latest.
+    $('#msgs').addEventListener('scroll', () => {
+      const box = $('#msgs');
+      if (box.scrollHeight - box.scrollTop - box.clientHeight < 90) jumpNew = 0;
+      updateJump();
+    }, { passive: true });
+    $('#jumpLatest').addEventListener('click', () => {
+      const box = $('#msgs');
+      box.scrollTo({ top: box.scrollHeight, behavior: reduceMotion() ? 'auto' : 'smooth' });
+      jumpNew = 0;
+      updateJump();
+      markRead();
+      haptic('light');
+    });
+
+    // Keyboard: Esc peels one layer, "/" opens search, 1-5 jump tabs,
+    // "?" shows a compact shortcut hint.
+    document.addEventListener('keydown', (e) => {
+      const typing = e.target.closest?.('input, textarea, [contenteditable="true"]');
+      if (e.key === 'Escape') { e.preventDefault(); handleBack(); return; }
+      if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === '/') { e.preventDefault(); openSearch(); }
+      else if (e.key === '?') toast('Esc back · / search · 1–5 tabs', { kind: 'info', ms: 2600 });
+      else if (/^[1-5]$/.test(e.key)) switchTab(TAB_ORDER[+e.key - 1]);
+    });
+
+    // Tabs get proper a11y semantics; the active one is announced.
+    $$('.tab').forEach(t => t.setAttribute('role', 'tab'));
+    const syncTabs = () => $$('.tab').forEach(t =>
+      t.setAttribute('aria-selected', t.classList.contains('is-active') ? 'true' : 'false'));
+    syncTabs();
+    $('#tabbar').addEventListener('click', syncTabs);
+
+    // Send button reflects an in-flight request (spinner + no double tap).
+    // A short one-shot failsafe handles the early returns (empty composer,
+    // chat ended, already sending) that never reach `pm-send-done`, without
+    // leaving a permanent interval running for the whole session.
+    let busyFallback = 0;
+    const clearBusy = () => {
+      clearTimeout(busyFallback);
+      $('#btnSend').classList.remove('is-busy');
+    };
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('#btnSend')) return;
+      $('#btnSend').classList.add('is-busy');
+      clearTimeout(busyFallback);
+      busyFallback = setTimeout(clearBusy, 700);
+    }, true);
+    window.addEventListener('pm-send-done', clearBusy);
+
+    // Announce the connection state once at start.
+    setNet(online ? 'ok' : 'error', online ? 'Connected' : 'Connecting…');
+  }
+
+  function emitSendDone() { window.dispatchEvent(new Event('pm-send-done')); }
 
   /* ────────────────────────── wiring ────────────────────────── */
   function bind() {
@@ -2924,9 +3701,16 @@
       renderPane();
     });
     $('#stickerGrid').addEventListener('click', async (e) => {
-      // A long-press on a Saved cell opens the remove sheet and consumes the
-      // click that follows it.
-      if (suppressGridClick) { suppressGridClick = false; return; }
+      // A long-press on a Saved cell consumes the click that follows it. The
+      // suppression is time-boxed, so if no trailing click ever arrives the
+      // next legitimate tap is not swallowed forever.
+      if (Date.now() < suppressGridClickUntil) return;
+      const retry = e.target.closest('[data-retry-pack]');
+      if (retry) {
+        delete packCache[retry.dataset.retryPack];
+        renderPane();
+        return;
+      }
       const em = e.target.closest('[data-emoji]');
       if (em) { insertEmoji(em.dataset.emoji); haptic('light'); return; }
       const sv = e.target.closest('[data-saved]');
@@ -2937,35 +3721,45 @@
       }
       const cell = e.target.closest('[data-sticker]');
       const prem = e.target.closest('[data-prem]');
-      const set = packCache[$('#stickerGrid').dataset.set];
-      if (!set) return;
-      if (cell) { sendSticker(set.stickers[+cell.dataset.sticker]); return; }
-      if (prem) { insertPremium(set.stickers[+prem.dataset.prem]); haptic('light'); }
+      const set = packData[$('#stickerGrid').dataset.set];
+      if (!set || !Array.isArray(set.stickers)) return;
+      if (cell) { const s = set.stickers[+cell.dataset.sticker]; if (s) sendSticker(s); return; }
+      if (prem) { const s = set.stickers[+prem.dataset.prem]; if (s) { insertPremium(s); haptic('light'); } }
     });
-    let savedHold = null;
-    const clearSavedHold = () => { if (savedHold) { clearTimeout(savedHold); savedHold = null; } };
+    // Saved-sticker long press. Track the pointer id and the start point so a
+    // scroll gesture cancels it; a bare timer used to fire the remove sheet
+    // while the user was just scrolling the grid.
     $('#stickerGrid').addEventListener('pointerdown', (e) => {
       const c = e.target.closest('[data-saved]');
       if (!c) return;
       clearSavedHold();
-      savedHold = setTimeout(() => {
+      const pid = e.pointerId, x0 = e.clientX, y0 = e.clientY, idx = +c.dataset.saved;
+      savedHold = { pid, x0, y0, timer: setTimeout(() => {
         savedHold = null;
-        suppressGridClick = true;
-        const s = social.savedStickers[+c.dataset.saved];
+        suppressGridClickUntil = Date.now() + 700;
+        const s = social.savedStickers[idx];
         if (s) openStickerDetail(s, true);
-      }, 480);
+      }, 480) };
     });
-    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
-      $('#stickerGrid').addEventListener(ev, clearSavedHold));
+    $('#stickerGrid').addEventListener('pointermove', (e) => {
+      if (!savedHold || e.pointerId !== savedHold.pid) return;
+      if (Math.abs(e.clientX - savedHold.x0) > 10 || Math.abs(e.clientY - savedHold.y0) > 10) clearSavedHold();
+    });
+    $('#stickerGrid').addEventListener('pointerup', clearSavedHold);
+    $('#stickerGrid').addEventListener('pointercancel', clearSavedHold);
+    $('#stickerGrid').addEventListener('pointerleave', clearSavedHold);
 
     $('#replyCancel').addEventListener('click', cancelReply);
 
     // Tap targets, resolved before the plain tap-to-reply / double-tap-to-❤️
-    // path. A swipe or long-press raises suppressUntil so its trailing click
-    // never becomes a reply.
+    // path. A swipe or long-press raises a *row-scoped* suppression so its
+    // trailing click never becomes a reply, while a tap on a different bubble
+    // within the same window still works.
     $('#msgs').addEventListener('click', (e) => {
-      if (Date.now() < suppressUntil) return;
       const el = e.target.closest('.msg');
+      const suppressed = Date.now() < suppressUntil
+        && (!el || !suppressId || String(el.dataset.id ?? '') === suppressId);
+      if (suppressed) return;
       if (!el) return;
       const m = state.messages.find(x => String(x.id) === el.dataset.id);
       if (!m) return;
@@ -3037,7 +3831,7 @@
       if (r) forwardTo(r.dataset.forward);
     });
 
-    $('#scrim').addEventListener('click', () => { closeCtx(); closeSheet(); closeInvite(); closePick(); closeSocial(); });
+    $('#scrim').addEventListener('click', () => { closeTopmost(); });
     $('#btnInvite').addEventListener('click', () => openInvite());
     $('#inviteRows').addEventListener('click', (e) => {
       const row = e.target.closest('[data-inv]');
@@ -3172,6 +3966,7 @@
       if (act === 'lite') { $('#liteToggle').click(); renderSettings(); }
       else if (act === 'cache') { $('#btnClearCache').click(); closeSheet(); }
       else if (act === 'bot') { $('#btnOpenBot').click(); closeSheet(); }
+      else if (act === 'exit') { closeSheet(); openExit(); }
     });
     $('#moreRows').addEventListener('click', (e) => {
       const b = e.target.closest('[data-more]');
@@ -3185,6 +3980,7 @@
       else if (act === 'invite') { closeSheet(); openInvite(); }
       else if (act === 'end') endVoiceChat();
       else if (act === 'leave') leaveGroupNow();
+      else if (act === 'exit') { closeSheet(); openExit(); }
     });
     $('#bannedRows').addEventListener('click', async (e) => {
       const b = e.target.closest('[data-unban]');
@@ -3205,9 +4001,6 @@
       switchTab('song');
     });
 
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') { closeSearch(); closeCtx(); closeSheet(); closeInvite(); closeDm(); closePick(); closeSocial(); }
-    });
   }
 
   /* ────────────────────────── ticker ────────────────────────── */
@@ -3234,6 +4027,7 @@
   /* ────────────────────────── go ────────────────────────── */
   renderSettings();
   bind();
+  wirePolish();
   boot();
   setInterval(tick, 250);
   // SSE is the live channel. Polling /api/state on top of it doubled every
@@ -3241,7 +4035,7 @@
   // while the event stream is down or has not connected yet.
   setInterval(() => {
     if (!online || sseLive) return;
-    api('/api/state').then(merge).then(() => queueRender()).catch(() => {});
+    api('/api/state', undefined, 8000).then((v) => { merge(v); setNet('ok', 'Live'); queueRender(); }).catch(() => {});
   }, 8000);
 
   // Background tabs: pause CSS animations and stop painting; on return do one

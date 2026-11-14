@@ -701,6 +701,7 @@ to open the same sheet, which mixed toggles with destructive operations.
 | Lite mode (device-local) | Refresh chat, Clear chat |
 | Clear media cache | Banned users (+ Unban) |
 | Open bot in Telegram | Invite & share, End voice chat, Leave group |
+| Exit / close app | Exit / close app |
 
 | Action | Path | Notes |
 | --- | --- | --- |
@@ -714,6 +715,123 @@ to open the same sheet, which mixed toggles with destructive operations.
 `GET /api/chats` and `GET /api/chat/banned` are handled in the GET branch
 *before* the POST-only router — a GET that falls through there returns 404 and
 the sheet silently loses its permissions.
+
+## Reliability, motion and small details
+
+This layer is deliberately client-side: it makes the app feel instant even
+when the Telegram bridge is slow, and it never depends on a page reload.
+
+### Chat rendering and optimistic sends
+
+* **Keyed incremental rendering.** `renderChat()` keeps a `Map` of DOM rows
+  keyed by message id. Unchanged rows are reused byte-for-byte, reaction-only
+  changes carry the existing animated-sticker node across, and new rows get a
+  short glow. The old renderer replaced `#msgs.innerHTML` on every SSE frame,
+  which destroyed Lottie players, dropped the scroll position and made a
+  swipe collapse mid-gesture.
+* **Full-list signature.** `sigOf()` hashes every message (id, mid, kind,
+  text, reaction, media, reply) with FNV-1a, not just the tail. An edit or a
+  reaction on an older bubble now repaints correctly.
+* **Optimistic sends with server idempotency.** A send is drawn immediately
+  with a `clientId`, then settled when `/api/chat/send` echoes it back.
+  `pendingMsgs` / `pendingReacts` expire after 20 s and are tagged with the
+  chat they belong to, so switching groups cannot leave a ghost bubble. A
+  failed send restores the rich composer DOM and removes the ghost.
+  `/api/chat/send` keeps a 120 s `uid:chat:clientId` ledger: a retry replays
+  the stored message (`duplicate: true`) instead of posting to Telegram
+  twice, a concurrent duplicate gets `409`, and a failed send releases the
+  key so it can be retried.
+* **Chat-tagged SSE frames.** Both `state` and `messages` frames carry
+  `chat`. A frame minted just before `/api/chat/select` can no longer pull the
+  header back to the group you just left. Unchanged `messages` frames are
+  skipped using `serverChatSig`.
+* **Request timeouts.** `api()` uses `AbortController` (25 s default, 8 s for
+  fallback polling), so a stalled bridge can never leave a permanent
+  "sending" spinner.
+
+### Swipe gestures
+
+One active pointer id, long press at 470 ms, a 12 px horizontal activation
+threshold with vertical-dominance check, `requestAnimationFrame`-batched
+transforms, `setPointerCapture`, and a 1.6 s watchdog for a dropped
+`pointerup`. A slow swipe that starts with 8–10 px steps now keeps waiting
+for decisive travel instead of being aborted as a scroll. `dragstart` and
+`contextmenu` are suppressed inside `.msg`; row-scoped click suppression
+means a swipe never becomes a reply while a tap on a different bubble still
+works. Chat repaints are deferred while a gesture is active.
+
+### Sticker system
+
+`paneGen` invalidates in-flight pack renders, and `packCache` caches the
+**promise** (so two quick taps issue one request) while `packData` holds the
+resolved data used by click handlers. A failed pack shows a Retry button.
+Saved-sticker long press tracks pointer id and start point, cancels on
+scroll, and its click suppression is time-boxed. `savedSeq` stops a stale
+read from repainting the list. On the server, saved stickers are whitelisted
+and length-capped, non-object entries are dropped, and a truncated JSON file
+is renamed to `stickers-<me>.corrupt-<ms>.json` instead of silently looking
+empty (which would have lost the recoverable data on the next save).
+
+### Page transitions and tap feedback
+
+* **Direction-aware views.** `switchTab()` stamps `#content[data-nav]` with
+  `fwd`/`back` from the tab order; the outgoing view cross-fades for 260 ms.
+  The tab indicator slides with `--tab-i`, and the active icon pops.
+* **Staggered list entrance** for results, members, queue, sheet rows and
+  chat rows (delays capped at 290 ms).
+* **Ripples and press-scale** on every control, plus hover affordances on
+  fine pointers and a `:focus-visible` ring for keyboard users.
+* **Sheet spring + drag-to-dismiss.** Sheets use an overshoot easing;
+  dragging from the grab area follows the finger and dismisses past 92 px or
+  on a fast flick. The dragged sheet is closed specifically, not whichever
+  layer happens to be topmost.
+* **Toast variants** (info / success / error / warn) with an icon, an
+  optional action button, tap-to-dismiss and an animation re-trigger when a
+  second toast replaces the first mid-flight. The send button shows a busy
+  spinner for the duration of a request.
+
+### Unified back stack and exit
+
+`closeTopmost()` peels exactly one layer in a fixed order; Telegram's
+BackButton, the scrim, `Escape` and the drag gesture all go through it.
+`syncChrome()` is driven by a `MutationObserver` over all overlays (including
+the inline sticker panel and reply bar) and keeps the app recede, the scrim
+and the native BackButton in sync — search is a full-screen panel below the
+scrim, so it is deliberately not dimmed. A tab jump closes every layer first
+and resyncs the BackButton.
+
+The **exit button**, plus "Exit / close app" in both the gear and "…" menus,
+opens a three-way sheet: close the app, go back to the bot, or stay.
+`doExit()` calls `WebApp.close()` and `window.close()`; in a browser preview
+where neither is allowed, a graceful "App closed / Reopen" curtain appears
+instead of a dead screen. `enableClosingConfirmation()` is requested on boot.
+Keyboard: `Escape` back, `/` search, `?` shortcuts, `1`–`5` tabs.
+
+### Status, jump-to-latest and motion guards
+
+A small **connection bar** reports Connected / Live / Reconnecting on boot,
+SSE open/error and fallback polling, and auto-hides after a successful
+connect. **Jump to latest** appears when you scroll away from the bottom or
+new messages arrive while you are away, with a "New" badge. Every effect is
+guarded by `prefers-reduced-motion`, `html.fx-lite` (device-local lite mode)
+and `html.app-hidden` (background tab freezes animations).
+
+### Static asset freshness
+
+`index.html`, `app.css` and `app.js` are all served `Cache-Control: no-store`.
+Caching the script for even 60 s while the HTML was `no-store` allowed a
+fresh page to pair with an old script — the exact mismatch that used to leave
+the app in a 401 loop after an auth change. Images keep a short 60 s cache.
+
+### Regression coverage
+
+`cargo test --release --workspace` covers 40 unit tests, including the
+send-idempotency ledger (claim / replay / in-flight / release / empty key),
+`clientId` echo with verified-identity override, duplicate replay without a
+second row, saved-sticker sanitisation and corrupt-file quarantine. Browser
+and HTTP smoke suites additionally cover auth fail-closed, SSE chat tags,
+swipe-to-reply, sticker pack races, sheet/scrim stacking, the exit flow,
+ripples, direction-aware transitions and reduced-motion guards.
 
 ## Troubleshooting
 
