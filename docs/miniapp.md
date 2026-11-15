@@ -760,6 +760,15 @@ for decisive travel instead of being aborted as a scroll. `dragstart` and
 means a swipe never becomes a reply while a tap on a different bubble still
 works. Chat repaints are deferred while a gesture is active.
 
+Travel is **rubber-banded** (`SWIPE_MAX` 88 px with an exponential falloff) so
+the row slows down instead of sliding off-screen. Crossing **52 px** arms the
+reply arrow exactly once — it turns solid blue, scales up and fires one
+selection haptic — and the arrow is anchored to the row (`translateX(-x)`) so
+it stays visible under the finger. Releasing armed fires the reply; releasing
+early springs the row back over 280 ms (`is-settling`) instead of snapping.
+`is-fired` pops the arrow on success. Every animation is disabled under
+`prefers-reduced-motion` and `html.fx-lite`.
+
 ### Sticker system
 
 `paneGen` invalidates in-flight pack renders, and `packCache` caches the
@@ -816,6 +825,52 @@ new messages arrive while you are away, with a "New" badge. Every effect is
 guarded by `prefers-reduced-motion`, `html.fx-lite` (device-local lite mode)
 and `html.app-hidden` (background tab freezes animations).
 
+### Typing, groups and the members tab
+
+**Typing is state, not a second socket.** `POST /api/chat/typing {typing}`
+records a short-lived row keyed by `(chat, user)`; the row lives for
+`TYPING_TTL` = 6 s and is swept by the reader, so a client that dies mid-word
+still disappears without sending `false`. The group and the display name come
+from the verified session — a body-supplied `chat`, `name` or `id` is ignored,
+and `uid == 0` (control-plane callers) can never invent a bubble. One viewer
+has one composer: a heartbeat in a second group moves the row instead of
+leaving a ghost behind, and `/api/chat/select` clears it.
+
+The list rides the normal SSE **state frame** (`data.typing`), sorted by
+expiry then id so the frame signature is stable; a heartbeat therefore costs
+no extra event type, and expiry pushes the "they stopped" frame on its own.
+The bar filters out yourself, names one person, "A & B" or "N people", shows
+the first typist's avatar, and is a polite live region.
+
+Client side, `noteTyping()` fires on `input`, non-modifier `keydown` and
+`paste`, throttled to one heartbeat per 2.5 s, with a 3.5 s idle stop. Sending
+a message, blurring the composer, switching tabs, hiding the page and
+`pagehide` all call `stopTyping()`; leaving a group clears the local list and
+the server row.
+
+**Group chats.** The switcher is a first-class list: a current-group card
+(monogram, title, live/idle + member count), one row per group with a
+deterministic tinted monogram (`chatTint`), last-message time, unread badge
+and live dot. Rows are keyboard-operable (`Enter`/`Space`), the active row is
+announced in its `aria-label`, and "Add bot to a group" opens the invite sheet
+so a new group gets its own chat automatically.
+
+**Members.** The tab gained a `•••` **More** sheet with local search, a
+three-way sort cycle (role → name → in-voice first), roster refresh, invite,
+group chats, private chats and (for admins) banned users. Search filters by
+name, `@username` and id with a proper empty state; sorting is client-side and
+instant. `POST /api/members/refresh` is open to every verified viewer but
+throttled for 10 s (plus the existing `roster_busy` guard), so a burst of taps
+does not hammer the Bot API. Invite is reachable from the header, the profile
+quick actions, the `•••` row menu and the invite button on every member row —
+all four open the same sheet and close the layer underneath first.
+
+**Cleanup.** The role legend was removed: every row already carries the same
+colour-coded tags inline, so it only pushed the list down. Closed sheets and
+the DM pane are now `pointer-events: none`, because a transformed/scrolled
+ancestor could bring their 2 %-offscreen edge back into view and swallow taps
+meant for the profile card underneath.
+
 ### Static asset freshness
 
 `index.html`, `app.css` and `app.js` are all served `Cache-Control: no-store`.
@@ -825,13 +880,16 @@ the app in a 401 loop after an auth change. Images keep a short 60 s cache.
 
 ### Regression coverage
 
-`cargo test --release --workspace` covers 40 unit tests, including the
+`cargo test --release --workspace` covers 45 unit tests, including the
 send-idempotency ledger (claim / replay / in-flight / release / empty key),
 `clientId` echo with verified-identity override, duplicate replay without a
-second row, saved-sticker sanitisation and corrupt-file quarantine. Browser
-and HTTP smoke suites additionally cover auth fail-closed, SSE chat tags,
-swipe-to-reply, sticker pack races, sheet/scrim stacking, the exit flow,
-ripples, direction-aware transitions and reduced-motion guards.
+second row, saved-sticker sanitisation and corrupt-file quarantine, typing
+scoping/expiry/deterministic ordering, the verified-identity typing route, the
+snapshot typing field and the refresh throttle. Browser and HTTP smoke suites
+additionally cover auth fail-closed, SSE chat tags, swipe-to-reply (including
+the 52 px arm state and cleanup), typing bar lifecycle, sticker pack races,
+sheet/scrim stacking, the exit flow, ripples, direction-aware transitions,
+the group switcher, members search/sort/More and every invite entry point.
 
 ## Troubleshooting
 

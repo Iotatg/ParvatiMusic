@@ -94,6 +94,9 @@
   /// Chat the viewer is looking at (one per group) and the switcher list.
   state.chat = { id: '', title: 'chingu gang', members: 0, live: true };
   state.chats = [];
+  /// Verified viewers currently composing in this group (from the state
+  /// stream). Self is filtered out when painting; entries expire server-side.
+  state.typing = [];
   const BLANK_ME = { name: 'You', username: 'you', photo: '', level: 1, levelPct: 0, toNext: '0m', listening: '0m', songs: 0, liked: 0 };
   let online = false;
   let localPos = 0;
@@ -185,6 +188,11 @@
     lastSig.chat = '';
     chatRenderDeferred = false;
     renderChat._first = undefined;
+    // Typing belongs to one group. Leaving it must not leave a "typing…" bar
+    // floating over the new timeline (the server clears the heartbeat too).
+    state.typing = [];
+    typingSig = null;
+    stopTyping();
   }
 
   function clearSavedHold() {
@@ -241,6 +249,7 @@
       }
     }
     if (next.members) state.members = next.members;
+    if (Array.isArray(next.typing)) state.typing = next.typing;
     if (next.chat) state.chat = { ...state.chat, ...next.chat };
     if (Array.isArray(next.chats)) {
       // Delete permissions are resolved by /api/chats when the switcher opens.
@@ -542,6 +551,7 @@
     renderQueue(force);
     renderProfile(force);
     renderChat(force);
+    renderTyping();
     renderMini();
     wireImgFallbacks();
   }
@@ -557,6 +567,69 @@
       renderQueued = false;
       renderAll(force);
     });
+  }
+
+  /* ── typing indicator ──────────────────────────────────────────────
+   * Telegram-style: a small bubble pinned just above the composer with
+   * three bouncing dots. The state stream carries a short-lived list of
+   * typists; this composer refreshes its own heartbeat at most every 2.5 s
+   * and clears it as soon as it goes quiet, sends, switches group or hides. */
+  const TYPING_REFRESH = 2500;
+  const TYPING_IDLE = 3500;
+  let typingSentAt = 0;
+  let typingIdleTimer = 0;
+  let typingIsOn = false;
+  let typingSig = null;             // sentinel: forces the first paint
+
+  const typingPeers = () => {
+    const me = String(viewer?.id || '');
+    return (state.typing || []).filter(t => String(t.id) !== me);
+  };
+
+  function renderTyping() {
+    const bar = $('#typingBar');
+    if (!bar) return;
+    const peers = typingPeers();
+    const sig = peers.map(p => `${p.id}:${p.name}`).join('|');
+    if (sig === typingSig) return;
+    typingSig = sig;
+    const on = peers.length > 0;
+    bar.classList.toggle('is-on', on);
+    bar.setAttribute('aria-hidden', on ? 'false' : 'true');
+    if (!on) return;
+    const names = peers.map(p => (p.name || 'Someone').trim().split(/\s+/)[0]);
+    const who = names.length === 1 ? names[0]
+      : names.length === 2 ? `${names[0]} & ${names[1]}`
+      : `${peers.length} people`;
+    $('#typingName').textContent = who;
+    const av = $('#typingAv');
+    delete av.dataset.dead;       // a new typist may have a different photo
+    av.src = peers[0].photo || avatarURI(names[0]);
+    av.dataset.name = names[0];
+  }
+
+  function postTyping(on) {
+    if (!online || !viewer?.id) return;
+    if (on && typingIsOn && Date.now() - typingSentAt < TYPING_REFRESH) return;
+    typingIsOn = on;
+    typingSentAt = Date.now();
+    // A failed heartbeat is harmless: the indicator is cosmetic and the next
+    // keystroke (or the server-side expiry) will settle it.
+    api('/api/chat/typing', { typing: on }, 6000).catch(() => {});
+  }
+
+  function noteTyping() {
+    if (!online || !viewer?.id) return;
+    clearTimeout(typingIdleTimer);
+    postTyping(true);
+    typingIdleTimer = setTimeout(stopTyping, TYPING_IDLE);
+  }
+
+  function stopTyping() {
+    clearTimeout(typingIdleTimer);
+    typingIdleTimer = 0;
+    if (!typingIsOn) return;
+    postTyping(false);
   }
 
   function renderRoom() {
@@ -897,21 +970,45 @@
     paintProgress();
   }
 
+  /// Members-tab view state. Both are part of the render signature so a
+  /// keystroke or a sort change repaints immediately instead of waiting for
+  /// the next server tick to change the roster.
+  let memberQuery = '';
+  let membersSort = 'role';                 // role | name | voice
+  const SORT_LABELS = { role: 'Role', name: 'Name', voice: 'In voice first' };
+  const SORT_CYCLE = ['role', 'name', 'voice'];
+
   function renderMembers(force = false) {
     const total = state.room.members || state.members.length;
     const live = isLive();
-    const inVoice = live ? state.members.filter(m => m.vc) : [];
-    const rest = state.members.filter(m => !inVoice.includes(m));
-    const sig = `${total}|${live}|${inVoice.length}|` + state.members
+    const q = memberQuery.trim().toLowerCase();
+    const all = q
+      ? state.members.filter(m => [m.name, m.username, m.custom, m.id]
+          .some(v => String(v || '').toLowerCase().includes(q)))
+      : state.members.slice();
+    const inVoice = live ? all.filter(m => m.vc) : [];
+    const rest = all.filter(m => !inVoice.includes(m));
+    const sig = `${total}|${live}|${inVoice.length}|${q}|${membersSort}|` + all
       .map(m => `${m.id}:${m.vc ? 1 : 0}:${m.role}:${m.name}:${m.photo}:${m.username}:${(m.tags || []).map(t => t.k).join('.')}`)
       .join(',');
     if (!force && sig === lastSig.members) return;
     lastSig.members = sig;
 
-    $('#membersLabel').textContent = `MEMBERS · ${total} · ${inVoice.length} IN VOICE`;
+    $('#membersLabel').textContent = q
+      ? `MEMBERS · ${all.length} MATCH${all.length === 1 ? '' : 'ES'}`
+      : `MEMBERS · ${total} · ${inVoice.length} IN VOICE`;
     const rank = { owner: 0, host: 1, admin: 2, member: 3 };
-    const sort = (list) => [...list].sort((a, b) =>
-      (rank[a.role] ?? 9) - (rank[b.role] ?? 9) || (b.vc ? 1 : 0) - (a.vc ? 1 : 0));
+    const byName = (a, b) => String(a.name || '')
+      .localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+    const sort = (list) => [...list].sort((a, b) => {
+      if (membersSort === 'name') return byName(a, b);
+      if (membersSort === 'voice') {
+        return (b.vc ? 1 : 0) - (a.vc ? 1 : 0)
+          || (rank[a.role] ?? 9) - (rank[b.role] ?? 9) || byName(a, b);
+      }
+      return (rank[a.role] ?? 9) - (rank[b.role] ?? 9)
+        || (b.vc ? 1 : 0) - (a.vc ? 1 : 0) || byName(a, b);
+    });
 
     const row = (m) => {
       const mine = String(m.id) === String(viewer?.id);
@@ -935,25 +1032,70 @@
             ${m.vc ? `<span class="dot">·</span><span class="member-flag"><svg class="ic"><use href="#i-mic"/></svg>in voice</span>` : ''}
           </div>
         </div>
-        ${mine || m.bot ? '' : `<button class="member-invite" data-invite="${esc(m.id)}" aria-label="Invite">
+        ${mine || m.bot ? '' : `<button class="member-invite" data-invite="${esc(m.id)}" aria-label="Invite ${esc(m.name || 'member')}">
           <svg class="ic"><use href="#i-plane"/></svg></button>`}
-        ${mine || m.bot ? '' : `<button class="promote-btn" data-menu="${esc(m.id)}">•••</button>`}
+        ${mine || m.bot ? '' : `<button class="promote-btn" data-menu="${esc(m.id)}" aria-label="More actions for ${esc(m.name || 'member')}">•••</button>`}
       </div>`;
     };
 
     let html = '';
-    if (inVoice.length) {
-      html += `<div class="member-group"><b class="g-live">● In voice chat</b><span>${inVoice.length}</span><span class="g-line"></span></div>`;
-      html += sort(inVoice).map(row).join('');
-    }
-    html += `<div class="member-group"><b>Group members</b><span>${rest.length}</span><span class="g-line"></span></div>`;
-    html += sort(rest).map(row).join('');
-    if (!rest.length) {
-      html += `<div class="member-more">Everyone in the group is already in the voice chat.</div>`;
-    } else if (total > state.members.length) {
-      html += `<div class="member-more">${total - state.members.length} more in the group — they appear here once Telegram returns them.</div>`;
+    if (q && !all.length) {
+      html = `<div class="member-empty">
+        <svg class="ic"><use href="#i-search"/></svg>
+        <b>No members found</b>
+        <span>Nothing matches “${esc(memberQuery.trim())}”</span>
+      </div>`;
+    } else {
+      if (inVoice.length) {
+        html += `<div class="member-group"><b class="g-live">● In voice chat</b><span>${inVoice.length}</span><span class="g-line"></span></div>`;
+        html += sort(inVoice).map(row).join('');
+      }
+      html += `<div class="member-group"><b>Group members</b><span>${rest.length}</span><span class="g-line"></span></div>`;
+      html += sort(rest).map(row).join('');
+      if (!q && !rest.length) {
+        html += `<div class="member-more">Everyone in the group is already in the voice chat.</div>`;
+      } else if (!q && total > state.members.length) {
+        html += `<div class="member-more">${total - state.members.length} more in the group — they appear here once Telegram returns them.</div>`;
+      }
     }
     $('#memberList').innerHTML = html;
+  }
+
+  /// Members-tab "more" sheet: local view controls up top, group-wide
+  /// shortcuts below. Everything is resolved on open, not on every tick.
+  const memRow = (act, label, hint, icon) => `
+    <button class="sheet-row" data-mem="${act}">
+      <span class="more-ic"><svg class="ic"><use href="#${icon}"/></svg></span>
+      <span class="lbl">${label}<div class="hint">${hint}</div></span>
+      <svg class="ic" style="width:12px;height:12px;color:#55565c"><use href="#i-chevron"/></svg>
+    </button>`;
+
+  function renderMembersSheet() {
+    const n = state.members.length;
+    const sub = $('#membersSheetSub');
+    if (sub) sub.textContent = `${n} shown · ${state.room.members || n} in the group · sorted by ${SORT_LABELS[membersSort].toLowerCase()}`;
+    const box = $('#membersSheetRows');
+    if (!box) return;
+    box.innerHTML = [
+      memRow('find', 'Search members', 'Filter by name, @username or id', 'i-search'),
+      memRow('refresh', 'Refresh members', 'Pull the latest group roster', 'i-repeat'),
+      memRow('sort', 'Sort by', `Currently: ${SORT_LABELS[membersSort]} · tap to cycle`, 'i-up'),
+      memRow('invite', 'Invite & share', 'Room link, or add the bot to a group', 'i-plane'),
+      memRow('chats', 'Group chats', 'Switch between the per-group chats', 'i-chat'),
+      memRow('dm', 'Private chats', 'One-to-one messages', 'i-lock'),
+      canManage() ? memRow('banned', 'Banned users', 'Review bans made through this app', 'i-ban') : '',
+    ].join('');
+  }
+
+  function openMembersSheet() {
+    haptic('light');
+    renderMembersSheet();
+    openSocial('#membersSheet');
+  }
+
+  function focusMemberSearch() {
+    closeSocial();
+    requestAnimationFrame(() => { $('#memberSearch')?.focus(); });
   }
 
   /// "Recently played" strip under the queue: the last tracks this room
@@ -1490,25 +1632,61 @@
     });
   }
 
+  /// A stable colour + initial per group. Telegram uses photos; the Bot API
+  /// cannot fetch a group's avatar for every row on every tick, so a
+  /// deterministic monogram gives each chat its own identity offline too.
+  const CHAT_TINTS = ['#2f9bff', '#8b5cf6', '#22c55e', '#f59e0b', '#ec4899', '#14b8a6', '#6366f1'];
+  function chatTint(id) {
+    let h = 0;
+    for (const ch of String(id || '')) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return CHAT_TINTS[h % CHAT_TINTS.length];
+  }
+  function chatInitial(title) {
+    const m = String(title || '?').trim().match(/[\p{L}\p{N}]/u);
+    return (m ? m[0] : '?').toUpperCase();
+  }
+
   function renderChatRows() {
     const box = $('#chatRows');
     if (!box) return;
     const list = state.chats || [];
+    const curId = String(state.chat?.id || '');
+    const cur = list.find(c => String(c.id) === curId) || {};
+    const name = cur.title || state.room?.title || 'Chat';
+    const subLine = $('#chatsSub');
+    if (subLine) subLine.textContent = list.length
+      ? `${list.length} group chat${list.length === 1 ? '' : 's'} · each group keeps its own messages`
+      : 'As soon as the bot joins a group, that group gets its own chat — nothing is ever shared between them.';
+    const card = $('#chatsCurrent');
+    if (card) {
+      const n = Math.max(0, +cur.members || 0);
+      card.innerHTML = `
+        <span class="cc-av" style="--cc:${chatTint(curId)}">${esc(chatInitial(name))}</span>
+        <span class="cc-body"><b>${esc(name)}</b>
+          <span>${cur.live ? 'Voice chat live' : 'Voice chat idle'}${n ? ` · ${n} member${n === 1 ? '' : 's'}` : ''}</span></span>
+        ${cur.live ? '<span class="cc-live">LIVE</span>' : ''}`;
+    }
     if (!list.length) {
-      box.innerHTML = '<div class="prof-none">No chats yet. As soon as the bot is in a group, its chat shows up here.</div>';
+      box.innerHTML = '<div class="prof-none">No chats yet. Add the bot to a group and its chat will appear here.</div>';
       return;
     }
     box.innerHTML = list.map((c) => {
-      const on = String(c.id) === String(state.chat.id);
+      const on = String(c.id) === curId;
       const unread = Math.max(0, +c.unread || 0);
       const sub = c.last_text
         ? `${c.last_ts ? `${c.last_ts} · ` : ''}${c.last_text}`
         : (c.live ? 'Voice chat live · no messages yet' : 'No messages yet');
-      return `<div class="chat-row ${on ? 'is-on' : ''}" data-chat="${esc(c.id)}" role="button" tabindex="0">
-          <span class="cr-ic"><svg class="ic"><use href="#i-users"/></svg></span>
+      const n = Math.max(0, +c.members || 0);
+      return `<div class="chat-row ${on ? 'is-on' : ''}" data-chat="${esc(c.id)}" role="button" tabindex="0"
+          aria-label="${esc(c.title || `Chat ${c.id}`)}${on ? ', current chat' : ''}">
+          <span class="cr-ic cr-avatar" style="--cc:${chatTint(c.id)}">${esc(chatInitial(c.title))}</span>
           <span class="cr-body"><b>${esc(c.title || `Chat ${c.id}`)}</b><span>${esc(sub)}</span></span>
-          ${c.live ? '<span class="cr-live"></span>' : ''}
-          ${unread ? `<span class="cr-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+          <span class="cr-meta">
+            ${c.last_ts ? `<i class="cr-time">${esc(c.last_ts)}</i>` : ''}
+            ${n ? `<i class="cr-count">${n} member${n === 1 ? '' : 's'}</i>` : ''}
+            ${c.live ? '<span class="cr-live" title="Voice chat live"></span>' : ''}
+            ${unread ? `<span class="cr-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+          </span>
           ${c.can_delete ? `<button class="cr-del" data-del-chat="${esc(c.id)}" aria-label="Delete chat">
             <svg class="ic"><use href="#i-trash"/></svg></button>` : ''}
         </div>`;
@@ -1647,6 +1825,7 @@
     if (tab !== 'chat') {
       $('#stickerPanel').classList.remove('is-on');
       $('#btnSticker').classList.remove('is-on');
+      stopTyping();               // leaving the composer means "stopped typing"
     }
     if (tab === 'chat') {
       unread = 0;
@@ -1791,6 +1970,7 @@
     if (textSending) return;
     const { text, entities } = readComposer();
     if (!text.trim()) return;
+    stopTyping();                 // the bubble is replaced by the real message
     const reply = replyTarget;
     // Keep the rich DOM (premium emoji spans) so a failed send restores the
     // exact composer contents instead of flattening them to plain text.
@@ -1841,6 +2021,7 @@
   async function sendSticker(s, thumb) {
     if (!chatLive()) { toast('Voice chat ended — chat is cleared'); return; }
     if (stickerSending || !s) return;
+    stopTyping();
     // Use the sticker document itself, not its static thumbnail: the Bot API
     // proxy answers with WebP / WebM / gzip `.tgs`, and media_kind tells the
     // bubble which renderer to use.
@@ -2259,8 +2440,11 @@
     $('#ctxName').textContent = m.username ? `@${m.username}` : m.name;
     const isAdmin = m.role === 'admin';
     $('#ctxPromote').querySelector('span').textContent = isAdmin ? 'Dismiss as admin' : 'Promote to admin';
+    const hideForSelf = !!m.bot || String(m.id) === String(viewer?.id);
     const dmRow = $('#ctxDm');
-    if (dmRow) dmRow.hidden = !!m.bot || String(m.id) === String(viewer?.id);
+    if (dmRow) dmRow.hidden = hideForSelf;
+    const invRow = $('#ctxInvite');
+    if (invRow) invRow.hidden = hideForSelf;
     const menu = $('#ctxMenu');
     menu.classList.add('is-open');
     $('#scrim').classList.add('is-on');
@@ -2292,6 +2476,10 @@
       dm.open = true;
       $('#dmSheet').classList.add('is-open');
       openDmThread(m.id);
+      return;
+    }
+    if (act === 'invite') {
+      openInvite(m.name);
       return;
     }
     const label = m.username ? `@${m.username}` : m.name;
@@ -2691,7 +2879,7 @@
   }
 
   /* ─────────────────── social: shared overlays ─────────────────── */
-  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet', '#bannedSheet', '#exitSheet'];
+  const SOCIAL_SHEETS = ['#profileSheet', '#msgMenu', '#stickerSheet', '#forwardSheet', '#chatsSheet', '#bannedSheet', '#exitSheet', '#membersSheet'];
 
   function closeSocial() {
     SOCIAL_SHEETS.forEach(s => { const el = $(s); if (el) el.classList.remove('is-open'); });
@@ -2761,16 +2949,18 @@
       `<div class="prof-stat"><b>${esc(String(s.v))}</b><span>${esc(s.l)}</span></div>`).join('');
 
     const quick = (act) => $(`#profileSheet [data-prof="${act}"]`);
-    const dm = quick('dm'), mention = quick('mention'), tg = quick('tg');
+    const dm = quick('dm'), mention = quick('mention'), tg = quick('tg'), inv = quick('invite');
     if (dm) dm.hidden = isMe || !!u.bot;
     if (mention) mention.hidden = isMe;
     if (tg) tg.hidden = !u.username;
+    if (inv) inv.hidden = isMe || !!u.bot;
 
     const rows = [];
     if (u.username) rows.push({ ic: '#i-at', label: `@${u.username}`, hint: 'Username · tap to copy', copy: `@${u.username}` });
     rows.push({ ic: '#i-info', label: `User ID · ${u.id}`, hint: 'Telegram account id · tap to copy', copy: String(u.id) });
     if (u.premium) rows.push({ ic: '#i-info', label: 'Telegram Premium', hint: 'This account has Premium' });
     if (u.username) rows.push({ ic: '#i-external', label: 'Open in Telegram', hint: `t.me/${u.username}`, act: 'tg' });
+    if (!isMe && !u.bot) rows.push({ ic: '#i-plane', label: 'Invite to this group', hint: 'Share the room link with them', act: 'invite' });
     if (!isMe && !u.bot) rows.push({ ic: '#i-lock', label: 'Send private message', hint: 'Only the two of you can read it', act: 'dm' });
     $('#profRows').innerHTML = rows.length
       ? rows.map(r => {
@@ -2811,6 +3001,15 @@
     if (act === 'tg') {
       if (u.username) openTelegram(`https://t.me/${u.username}`);
       else toast('No public username');
+      return;
+    }
+    if (act === 'invite') {
+      // Tapping a member should always offer a way to bring them in: the
+      // invite sheet carries the room link, a Telegram share and the
+      // "add bot to a group" entry.
+      closeSocial();
+      openInvite(u.name || 'this member');
+      haptic('light');
     }
   }
 
@@ -3012,14 +3211,25 @@
   function wireChatGestures() {
     const box = $('#msgs');
     let g = null;
+    /// Telegram-feel constants: the bubble follows the finger with a soft
+    /// rubber-band cap; crossing SWIPE_FIRE arms the reply arrow (solid blue
+    /// + one selection haptic) instead of waiting for the finger to lift.
+    const SWIPE_FIRE = 52;
+    const SWIPE_MAX = 88;
+    const damped = (raw) => Math.min(SWIPE_MAX + 4,
+      SWIPE_MAX * (1 - Math.exp(-Math.max(0, raw) / (SWIPE_FIRE * 0.92))));
 
-    const settle = (el) => {
+    const cleanRow = (el) => {
       if (!el) return;
-      el.classList.remove('is-swiping');
-      el.style.transform = '';
+      el.classList.remove('is-swiping', 'is-armed', 'is-fired');
+      el.style.removeProperty('transform');
+      el.style.removeProperty('--swipe-x');
+      el.style.removeProperty('--swipe-o');
+      el.style.removeProperty('--swipe-s');
       const hint = el.querySelector('.swipe-hint');
       if (hint) hint.style.opacity = '';
     };
+    const settle = (el) => cleanRow(el);
 
     /// One place that ends a gesture and applies any chat frame that was held
     /// back while the finger was down. Without this a dropped pointerup could
@@ -3032,13 +3242,17 @@
       if (cur.watchdog) clearTimeout(cur.watchdog);
       if (cur.active) {
         if (spring) {
-          // Let CSS animate the row back to rest instead of snapping.
-          cur.el.classList.remove('is-swiping');
+          // Let CSS animate the row back to rest instead of snapping. The
+          // arrow fades out over the same 200 ms while keeping its position.
+          cur.el.classList.remove('is-swiping', 'is-armed');
           cur.el.classList.add('is-settling');
           cur.el.style.transform = '';
+          cur.el.style.removeProperty('--swipe-x');
+          cur.el.style.removeProperty('--swipe-o');
+          cur.el.style.removeProperty('--swipe-s');
           const hint = cur.el.querySelector('.swipe-hint');
           if (hint) hint.style.opacity = '';
-          setTimeout(() => cur.el && cur.el.classList.remove('is-settling'), 280);
+          setTimeout(() => cur.el && cur.el.classList.remove('is-settling'), 300);
         } else {
           settle(cur.el);
         }
@@ -3067,7 +3281,7 @@
       // leave its long-press timer running (which opened a stray menu later).
       if (g) { finish(g, g.active); }
       g = { id: e.pointerId, el, m, x0: e.clientX, y0: e.clientY, dx: 0,
-            active: false, timer: null, raf: 0, watchdog: null };
+            active: false, armed: false, timer: null, raf: 0, watchdog: null };
       g.timer = setTimeout(() => {
         const cur = g;
         if (!cur || cur.active || cur.id !== e.pointerId) return;
@@ -3110,25 +3324,43 @@
         gestureActive = true;                // defer chat renders mid-swipe
         try { g.el.setPointerCapture(e.pointerId); } catch {}
         g.el.classList.add('is-swiping');
-        const hint = g.el.querySelector('.swipe-hint');
-        if (hint) hint.style.opacity = '1';
       }
-      g.dx = clamp(dx, 0, 84);
+      const x = damped(dx);
+      g.dx = x;
       // Batch transform writes into one animation frame instead of forcing a
-      // layout on every pointermove event.
-      const el = g.el, x = g.dx;
+      // layout on every pointermove. --swipe-x keeps the reply arrow anchored
+      // to the screen edge while the bubble moves; --swipe-o / --swipe-s drive
+      // its opacity and scale so it grows smoothly instead of popping in.
+      const el = g.el, p = Math.min(1, x / SWIPE_FIRE);
       if (g.raf) cancelAnimationFrame(g.raf);
       g.raf = requestAnimationFrame(() => {
-        if (el.isConnected) el.style.transform = `translateX(${x}px)`;
+        if (!g || !el.isConnected) return;
+        el.style.transform = `translateX(${x}px)`;
+        el.style.setProperty('--swipe-x', `${x}px`);
+        el.style.setProperty('--swipe-o', String(Math.min(1, 0.12 + p * 0.88)));
+        el.style.setProperty('--swipe-s', String(0.5 + p * 0.6));
+        const armed = x >= SWIPE_FIRE;
+        if (armed !== g.armed) {
+          g.armed = armed;
+          el.classList.toggle('is-armed', armed);
+          if (armed) haptic('select');   // exactly once per crossing
+        }
       });
     });
 
     const end = (e) => {
       if (!g || e.pointerId !== g.id) return;
       const cur = g;
-      const fired = cur.active && cur.dx > 54;
+      const fired = cur.active && cur.dx >= SWIPE_FIRE;
       finish(cur, cur.active, cur.active);
-      if (fired) { haptic('light'); setReply(cur.m); }
+      if (fired) {
+        haptic('light');
+        if (cur.el.isConnected) {
+          cur.el.classList.add('is-fired');
+          setTimeout(() => cur.el?.classList.remove('is-fired'), 320);
+        }
+        setReply(cur.m);
+      }
     };
     box.addEventListener('pointerup', end);
     box.addEventListener('pointercancel', (e) => {
@@ -3162,7 +3394,7 @@
   const OVERLAY_SELECTORS = [
     '#exitSheet', '#searchOverlay', '#profileSheet', '#msgMenu', '#stickerSheet',
     '#forwardSheet', '#chatsSheet', '#bannedSheet', '#inviteSheet', '#sleepSheet',
-    '#pickSheet', '#settingsSheet', '#moreSheet', '#dmSheet', '#ctxMenu',
+    '#pickSheet', '#settingsSheet', '#moreSheet', '#membersSheet', '#dmSheet', '#ctxMenu',
   ];
   // The sticker panel and reply bar are inline popovers inside the chat view,
   // not full overlays, but they still belong on the back stack: BackButton /
@@ -3269,6 +3501,7 @@
       ['#forwardSheet', closeSocial], ['#stickerSheet', closeSocial],
       ['#msgMenu', closeSocial], ['#profileSheet', closeSocial],
       ['#chatsSheet', closeSocial], ['#bannedSheet', closeSocial],
+      ['#membersSheet', closeSocial],
       ['#ctxMenu', closeCtx], ['#dmSheet', closeDm],
       ['#pickSheet', closePick], ['#inviteSheet', closeInvite],
       ['#sleepSheet', () => $('#sleepSheet').classList.remove('is-open')],
@@ -3673,20 +3906,25 @@
       if (composerText()) sendText();
       else toast('Hold to record a voice note');
     });
-    editor().addEventListener('input', updateSendState);
+    editor().addEventListener('input', () => { updateSendState(); noteTyping(); });
     editor().addEventListener('focus', () => {
       $('#stickerPanel').classList.remove('is-on');
       $('#btnSticker').classList.remove('is-on');
       setTimeout(scrollChat, 240);
     });
     editor().addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); return; }
+      // Report on the very first keypress too, not only once the DOM changes
+      // (a backspace on an empty composer still means "someone is typing").
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) noteTyping();
     });
     editor().addEventListener('paste', (e) => {
       e.preventDefault();
       const text = (e.clipboardData || window.clipboardData).getData('text');
       insertNode(document.createTextNode(text));
+      noteTyping();
     });
+    editor().addEventListener('blur', stopTyping);
 
     $('#btnSticker').addEventListener('click', () => openPanel());
     $$('.sticker-tab').forEach(t => t.addEventListener('click', () => {
@@ -3802,6 +4040,54 @@
       const b = e.target.closest('[data-act]');
       if (b) memberAction(b.dataset.act);
     });
+    $('#btnMembersMore').addEventListener('click', openMembersSheet);
+    // Search is local: no request per keystroke, and the roster signature
+    // includes the query so only a real change rebuilds the list.
+    const search = $('#memberSearch');
+    const clearSearch = $('#memberSearchClear');
+    const applySearch = () => {
+      memberQuery = search.value || '';
+      if (clearSearch) clearSearch.hidden = !memberQuery;
+      renderMembers(true);
+    };
+    search.addEventListener('input', applySearch);
+    search.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { search.value = ''; applySearch(); search.blur(); }
+    });
+    clearSearch.addEventListener('click', () => {
+      search.value = ''; applySearch(); search.focus();
+    });
+    $('#membersSheetRows').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-mem]');
+      if (!b) return;
+      const act = b.dataset.mem;
+      haptic('light');
+      if (act === 'find') focusMemberSearch();
+      else if (act === 'sort') {
+        membersSort = SORT_CYCLE[(SORT_CYCLE.indexOf(membersSort) + 1) % SORT_CYCLE.length];
+        renderMembers(true);
+        renderMembersSheet();
+        toast(`Sorted by ${SORT_LABELS[membersSort].toLowerCase()}`);
+      } else if (act === 'refresh') {
+        closeSocial();
+        toast('Refreshing members…');
+        try {
+          await api('/api/members/refresh', {});
+          // The roster pass runs in the background; give it a moment before
+          // repainting so the new names are actually in the snapshot.
+          await new Promise(r => setTimeout(r, 1200));
+          const s = await api('/api/state');
+          merge(s);
+          renderAll(true);
+          toast(`Members updated · ${state.members.length} shown`);
+        } catch (err) {
+          toast(`Refresh failed: ${err.message}`);
+        }
+      } else if (act === 'invite') { closeSocial(); openInvite(); }
+      else if (act === 'chats') { closeSocial(); openChats(); }
+      else if (act === 'dm') { closeSocial(); openDm(); }
+      else if (act === 'banned') { closeSocial(); openBanned(); }
+    });
 
     // ── social v3: profile / message actions / sticker detail / forward
     $('#profileSheet').addEventListener('click', (e) => {
@@ -3854,11 +4140,20 @@
     $('#chatSwitch').addEventListener('click', openChats);
     $('#chatsRefresh').addEventListener('click', () => refreshChats());
     $('#chatClearRow').addEventListener('click', clearChatNow);
+    $('#chatAddRow').addEventListener('click', () => { closeSocial(); openInvite(); });
     $('#chatRows').addEventListener('click', (e) => {
       const del = e.target.closest('[data-del-chat]');
       if (del) { e.stopPropagation(); deleteChat(del.dataset.delChat); return; }
       const row = e.target.closest('[data-chat]');
       if (row) switchChat(row.dataset.chat);
+    });
+    // Rows advertise role=button: make Enter/Space work like a real tap.
+    $('#chatRows').addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const row = e.target.closest('[data-chat]');
+      if (!row) return;
+      e.preventDefault();
+      switchChat(row.dataset.chat);
     });
     $('#chatSeg').addEventListener('click', (e) => {
       const b = e.target.closest('[data-scope]');
@@ -4043,9 +4338,12 @@
   document.addEventListener('visibilitychange', () => {
     const hidden = document.hidden;
     document.documentElement.classList.toggle('app-hidden', hidden);
-    if (!hidden) {
+    if (hidden) {
+      stopTyping();
+    } else {
       if (renderDirty) queueRender();
       if (online && !sseLive) api('/api/state').then(merge).then(() => queueRender()).catch(() => {});
     }
   });
+  window.addEventListener('pagehide', stopTyping);
 })();

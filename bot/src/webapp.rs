@@ -46,8 +46,10 @@
 //!   POST /api/chat/forget      { id } — remove a chat from the app (Telegram untouched)
 //!   POST /api/chat/clear       wipe the current chat's mirror
 //!   POST /api/chat/read        mark the current chat read for this viewer
+//!   POST /api/chat/typing     { typing: bool } — short-lived "is typing" state
 //!   POST /api/stickers/saved   { me, action: add|remove, sticker|id }
 //!   POST /api/members          { id, action: promote|demote|kick|ban|unban }
+//!   POST /api/members/refresh  re-read the group roster (rate limited)
 //!   POST /api/session/end      { id, name } — stop, leave, clear, summarise
 //!   POST /api/settings         { autoplay?: bool, ... }
 //!
@@ -81,6 +83,8 @@ const CHAT_CAP: usize = 300;
 const ROSTER_TTL: u64 = 20;
 /// How long a completed chat-send idempotency key stays replayable.
 const SEND_DEDUPE_TTL: u64 = 120;
+/// Seconds a "typing…" heartbeat survives without a refresh.
+const TYPING_TTL: u64 = 6;
 /// How long a "user X is admin of group Y" answer stays usable.
 const ADMIN_TTL: u64 = 120;
 
@@ -219,6 +223,12 @@ pub struct MiniApp {
     /// message stops a duplicate Telegram post. A Null message marks a send
     /// that is still in flight, so two concurrent taps cannot both post.
     send_dedupe: Mutex<HashMap<String, (u64, Value)>>,
+    /// Who is composing a message right now: `(chat id, user id)` →
+    /// `(display name, expiry)`. Entries are short-lived (a few seconds), are
+    /// scoped to one group, and never touch the mirrored message log. The
+    /// state stream carries the list, so every open client can paint the
+    /// "typing…" bubble without a second socket or a poll.
+    typing: Mutex<HashMap<(i64, i64), (String, u64)>>,
     /// Optional shared secret (`MINIAPP_TOKEN`) for trusted integrations. It
     /// never grants a *user* identity — only the control plane.
     token: String,
@@ -558,6 +568,7 @@ pub fn install(rooms: Rooms) {
         sleep_at: Mutex::new(0),
         roster_busy: AtomicBool::new(false),
         send_dedupe: Mutex::new(HashMap::new()),
+        typing: Mutex::new(HashMap::new()),
         token: env_str("MINIAPP_TOKEN", ""),
         bot_token: {
             let t = env_str("TOKEN", "");
@@ -1177,6 +1188,11 @@ impl MiniApp {
             out["chat"] = self.chat_head(chat, viewer);
             out["chats"] = json!(self.chat_list(viewer));
         }
+        // Typing rides the state stream: the per-connection signature changes
+        // as soon as somebody starts or stops composing, so no separate event
+        // channel (and no client-side poll) is needed. Expired rows are swept
+        // here, which also pushes the "they stopped" frame automatically.
+        out["typing"] = json!(self.typing_list(self.chat_for(viewer)));
         out
     }
 
@@ -1496,6 +1512,65 @@ impl MiniApp {
                 map.remove(&key);
             }
         }
+    }
+
+    /// A typing heartbeat stays valid for a few seconds. The composer sends
+    /// `true` while it changes and an explicit `false` when it goes quiet, so
+    /// no timer thread is needed: `typing_list` drops stale rows on the next
+    /// state frame and that very change pushes a fresh SSE payload.
+    fn typing_set(&self, chat: i64, uid: i64, name: &str, on: bool) {
+        // A control-plane caller has no Telegram identity and must never be
+        // able to invent a "someone is typing" bubble.
+        if uid == 0 {
+            return;
+        }
+        let mut map = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        // One viewer has one composer. Clearing/refreshing it also removes any
+        // stale entry left behind in another group after a chat switch.
+        map.retain(|(_, u), _| *u != uid);
+        if !on {
+            return;
+        }
+        let clean: String = name.trim().chars().take(48).collect();
+        let who = if clean.is_empty() {
+            format!("User {uid}")
+        } else {
+            clean
+        };
+        map.insert((chat, uid), (who, now_secs() + TYPING_TTL));
+        if map.len() > 64 {
+            let now = now_secs();
+            map.retain(|_, (_, exp)| *exp > now);
+        }
+    }
+
+    /// Active typists in one group, most recent first. Only public display
+    /// data is exposed; the client filters out the viewer itself.
+    fn typing_list(&self, chat: i64) -> Vec<Value> {
+        let now = now_secs();
+        let mut map = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (_, exp)| *exp > now);
+        // Deterministic order matters: the SSE frame is compared as a string,
+        // so a HashMap iteration that shuffles two equal expiries would make
+        // the payload "change" every second and repaint every open client.
+        let mut rows: Vec<(u64, i64, Value)> = map
+            .iter()
+            .filter(|((c, _), _)| *c == chat)
+            .map(|((_, uid), (name, exp))| {
+                (
+                    *exp,
+                    *uid,
+                    json!({
+                        "id": uid.to_string(),
+                        "name": name,
+                        "photo": format!("/api/avatar/{uid}"),
+                    }),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        rows.truncate(4);
+        rows.into_iter().map(|(_, _, v)| v).collect()
     }
 
     fn push_message(&self, chat: i64, msg: Value) {
@@ -4313,6 +4388,9 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(auth.id(), id);
+            // A composer left open in the old group must not keep showing
+            // "typing…" there (or pop up in the newly selected one).
+            app.typing_set(id, auth.id(), "", false);
             app.mark_read(id, Some(auth));
             // A chat picked for the first time may still be titled "Chat -100…".
             if let Some(hub) = crate::webapp::app() {
@@ -4324,6 +4402,14 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             let target = app.chat_for(Some(auth));
             app.mark_read(target, Some(auth));
             return (200, json!({ "ok": true }));
+        }
+        "/api/chat/typing" => {
+            // The chat is always the one the *verified viewer* is looking at;
+            // a client cannot announce typing into someone else's group.
+            let chat = app.chat_for(Some(auth));
+            let on = body["typing"].as_bool().unwrap_or(false);
+            app.typing_set(chat, auth.id(), &auth.name, on);
+            return (200, json!({ "ok": true, "typing": app.typing_list(chat) }));
         }
         "/api/stickers/saved" => {
             let me = auth.me(body["me"].as_str().unwrap_or("").to_string());
@@ -4391,6 +4477,18 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 }
                 None => return (503, json!({ "error": "telegram bridge offline" })),
             }
+        }
+        "/api/members/refresh" => {
+            // Re-reading the public roster is safe for every verified viewer,
+            // but it is an expensive Bot API pass. A short cooldown (plus the
+            // existing `roster_busy` guard) keeps a burst of taps cheap.
+            if app.roster_age() < 10 {
+                return (200, json!({ "ok": true, "throttled": true }));
+            }
+            if let Some(hub) = APP.get().cloned() {
+                thread::spawn(move || hub.refresh_roster());
+            }
+            return (200, json!({ "ok": true }));
         }
         "/api/session/end" => {
             let target = app.chat_for(Some(auth));
@@ -4862,6 +4960,7 @@ mod chat_tests {
             sleep_at: Mutex::new(0),
             roster_busy: AtomicBool::new(false),
             send_dedupe: Mutex::new(HashMap::new()),
+            typing: Mutex::new(HashMap::new()),
             token: String::new(),
             bot_token: String::new(),
             allowed_ids: Vec::new(),
@@ -5281,5 +5380,151 @@ mod chat_tests {
                 let _ = std::fs::remove_file(e.path());
             }
         }
+    }
+
+    #[test]
+    fn typing_is_per_group_per_viewer_and_sweeps_expired_rows() {
+        let (app, dir) = app();
+        assert!(app.typing_list(HOME).is_empty());
+        app.typing_set(HOME, 7, "  Ada Lovelace  ", true);
+        app.typing_set(OTHER, 9, "Grace", true);
+        let home = app.typing_list(HOME);
+        assert_eq!(home.len(), 1);
+        assert_eq!(home[0]["id"], "7");
+        assert_eq!(home[0]["name"], "Ada Lovelace");
+        assert!(home[0]["photo"].as_str().unwrap().contains("/api/avatar/7"));
+        assert_eq!(app.typing_list(OTHER)[0]["id"], "9");
+        // One viewer has one composer: a heartbeat in a second group moves
+        // the bubble instead of leaving a ghost in the first one.
+        app.typing_set(OTHER, 7, "Ada", true);
+        assert!(app.typing_list(HOME).is_empty());
+        assert_eq!(app.typing_list(OTHER).len(), 2);
+        app.typing_set(OTHER, 7, "", false);
+        assert_eq!(app.typing_list(OTHER).len(), 1);
+        // Stale rows are dropped by the reader, so the SSE signature changes
+        // on its own when somebody stops typing without sending `false`.
+        {
+            let mut map = app.typing.lock().unwrap();
+            for (_, (_, exp)) in map.iter_mut() {
+                *exp = 1;
+            }
+        }
+        assert!(app.typing_list(OTHER).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typing_route_uses_verified_identity_and_ignores_client_chat() {
+        let (app, dir) = app();
+        let auth = viewer(7);
+        let (code, out) = route_api(
+            &app,
+            &post(
+                "/api/chat/typing",
+                json!({ "typing": true, "chat": OTHER.to_string(), "name": "Impostor" }),
+            ),
+            &auth,
+        );
+        assert_eq!(code, 200);
+        // The name and the group come from the verified session, never the body.
+        assert_eq!(out["typing"][0]["name"], "User 7");
+        assert_eq!(app.typing_list(HOME).len(), 1);
+        assert!(app.typing_list(OTHER).is_empty());
+        // A control-plane caller (no user id) cannot invent a typing bubble.
+        let guest = Auth {
+            ok: true,
+            user_id: None,
+            name: "Ghost".to_string(),
+            username: String::new(),
+            via: "token",
+        };
+        route_api(&app, &post("/api/chat/typing", json!({ "typing": true })), &guest);
+        assert_eq!(app.typing_list(HOME).len(), 1);
+        route_api(&app, &post("/api/chat/typing", json!({ "typing": false })), &auth);
+        assert!(app.typing_list(HOME).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typing_list_is_deterministic_and_capped() {
+        let (app, dir) = app();
+        // HashMap iteration order is random. The state stream hashes its
+        // snapshot, so an unstable list would produce a fake "changed" frame
+        // on every broadcast. Heartbeats written in the same second must come
+        // back ordered by id and truncated to a sane bubble size.
+        for uid in [9, 3, 7, 1, 5, 2] {
+            app.typing_set(HOME, uid, &format!("User {uid}"), true);
+        }
+        let list = app.typing_list(HOME);
+        assert_eq!(list.len(), 4, "the typing bar never lists more than four people");
+        assert_eq!(
+            list.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["1", "2", "3", "5"],
+        );
+        let again = app.typing_list(HOME);
+        assert_eq!(list, again, "two reads in the same tick must be byte-identical");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshot_carries_typing_and_selecting_a_group_clears_it() {
+        let (app, dir) = app();
+        let auth = viewer(7);
+        // Register the second group so /api/chat/select accepts it.
+        app.chat_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(OTHER, json!({}));
+
+        app.typing_set(HOME, 7, "Ada", true);
+        app.typing_set(HOME, 9, "Grace", true);
+        let snap = app.snapshot(false, Some(&auth));
+        assert_eq!(snap["typing"].as_array().map(|a| a.len()), Some(2));
+        assert!(snap["typing"][0]["photo"].as_str().unwrap().starts_with("/api/avatar/"));
+
+        // Switching groups must not leave the composer's bubble behind in
+        // the old timeline, nor let it pop up in the new one.
+        let (code, out) = route_api(
+            &app,
+            &post("/api/chat/select", json!({ "id": OTHER.to_string() })),
+            &auth,
+        );
+        assert_eq!(code, 200);
+        assert_eq!(out["chat"], OTHER.to_string());
+        // The stream is scoped to the group the viewer now sees: the old
+        // group's bubbles must not ride along into the new timeline.
+        let snap = app.snapshot(false, Some(&auth));
+        assert!(snap["typing"].as_array().map(|a| a.is_empty()).unwrap_or(false));
+        let home = app.typing_list(HOME);
+        assert_eq!(home.len(), 1, "the other viewer's heartbeat in HOME survives");
+        assert_eq!(home[0]["id"], "9");
+        assert!(home.iter().all(|r| r["id"] != "7"), "the switcher's own bubble is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn members_refresh_is_throttled_after_a_recent_roster_read() {
+        let (app, dir) = app();
+        let auth = viewer(7);
+        // A cold cache (roster_at = 0) accepts the refresh. Unit tests never
+        // install the global APP handle, so no Telegram thread is spawned.
+        let (code, out) = route_api(&app, &post("/api/members/refresh", json!({})), &auth);
+        assert_eq!(code, 200);
+        assert_eq!(out["ok"], true);
+        assert!(out["throttled"].is_null(), "a cold cache must actually refresh");
+
+        // Pretend the roster was just read: a burst of taps must be cheap.
+        *app.roster_at.lock().unwrap_or_else(|e| e.into_inner()) = now_secs();
+        let (code, out) = route_api(&app, &post("/api/members/refresh", json!({})), &auth);
+        assert_eq!(code, 200);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["throttled"], true);
+
+        // The route is not admin-gated: any verified viewer may ask for a
+        // re-read (the global auth gate in the HTTP handler still applies).
+        let plain = viewer(42);
+        let (code, _) = route_api(&app, &post("/api/members/refresh", json!({})), &plain);
+        assert_eq!(code, 200);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
