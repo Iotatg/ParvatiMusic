@@ -871,6 +871,49 @@ the DM pane are now `pointer-events: none`, because a transformed/scrolled
 ancestor could bring their 2 %-offscreen edge back into view and swallow taps
 meant for the profile card underneath.
 
+### Leaving a group, message identity and playback fallbacks
+
+**A group the bot left disappears.** Two independent signals feed
+`mark_chat_left`: the MTProto `ParticipantUpdate` for the bot's own id (covers
+a live kick while the app is open) and the Bot API error on the next roster
+pass (`bot was kicked from the supergroup chat`, `chat not found`). The second
+one matters because a kicked bot stops receiving updates — without it a chat
+stayed in the switcher forever with zero members. A left group keeps its
+mirror on disk but is filtered from `/api/chats`, `chat_known` and
+`active_chat`; the app falls back to the newest reachable group, so switching
+still works. `mark_chat_joined` clears the flag on a re-invite and the old
+history comes back instead of a new empty chat.
+
+**Reply quotes survive the round trip.** `/api/chat/send` resolved the quote
+for Telegram but dropped it from the echoed/mirrored message, so a
+swipe-to-reply bubble lost its header as soon as the SSE frame replaced the
+optimistic row. The server now resolves `reply` from the local mirror (falling
+back to the client's copy for a local-only bubble with `mid 0`) and includes
+it in every returned message. `setReply` also falls back to `@username` and a
+neutral label when a row has no display name.
+
+**Who authors the message.** Bot API messages are always sent by the bot. When
+the verified viewer *is* one of the `STRING_SESSIONS` accounts, the message is
+sent through that account's own MTProto session (`send_text`), so the Telegram
+group shows the real person. Every other viewer keeps the bot transport and is
+attributed to their verified id inside the app (`from`, `name`, avatar,
+permissions); the app never claims the bot is the author. Text is HTML-escaped
+before `send_text` so a literal `<b>` is not turned into markup.
+
+**Video falls back to audio, not to a dead tap.** When a video source refuses
+this host (YouTube's bot check), the same track is downloaded as audio and
+played, with a soft warning toast ("Video source unavailable — playing audio")
+instead of a red failure. The picture is never faked with a cover slideshow and
+a different song is never substituted. The PO-token provider
+(`/root/bgutil`, port 4416) is now supervised alongside the other sidecars, so
+a restart cannot silently remove the component yt-dlp needs.
+
+**Render budget.** The 4 Hz ticker used to write identical width/left/text
+values into the DOM every tick, forcing a style/layout pass for no visual
+change. Progress, mini-player, room title, chat header and the open group
+switcher now compare before writing; the switcher is also signature-gated so a
+playhead tick cannot rebuild it under the user's finger.
+
 ### Static asset freshness
 
 `index.html`, `app.css` and `app.js` are all served `Cache-Control: no-store`.
@@ -880,7 +923,7 @@ the app in a 401 loop after an auth change. Images keep a short 60 s cache.
 
 ### Regression coverage
 
-`cargo test --release --workspace` covers 45 unit tests, including the
+`cargo test --release --workspace` covers 47 unit tests, including the
 send-idempotency ledger (claim / replay / in-flight / release / empty key),
 `clientId` echo with verified-identity override, duplicate replay without a
 second row, saved-sticker sanitisation and corrupt-file quarantine, typing

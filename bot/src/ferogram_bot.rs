@@ -298,6 +298,28 @@ async fn dispatch_update(upd: &Update, shared: &Arc<Mutex<Shared>>, client: &Cli
             // stickers, replies) — skipped unless it is the mirrored chat.
             mirror_to_miniapp(m, &msg);
         }
+        // The bot itself was added to / removed from a group. This is the only
+        // reliable signal: a kicked bot stops receiving messages, so a
+        // `ChatDeleteUser` service message never reaches it. Hiding the chat
+        // here is what makes the switcher drop a dead group immediately.
+        Update::ParticipantUpdate(p) => {
+            let self_id = shared.lock().unwrap_or_else(|e| e.into_inner()).id.id;
+            if p.user_id == self_id && self_id != 0 {
+                let peer = if p.is_channel {
+                    tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: p.chat_id })
+                } else {
+                    tl::enums::Peer::Chat(tl::types::PeerChat { chat_id: p.chat_id })
+                };
+                let chat_id = peer_i64(Some(&peer));
+                let joined = p.new_participant.is_some() || p.new_channel_participant.is_some();
+                let left = p.prev_participant.is_some() || p.prev_channel_participant.is_some();
+                if joined {
+                    crate::webapp::mark_chat_joined(chat_id);
+                } else if left {
+                    crate::webapp::mark_chat_left(chat_id);
+                }
+            }
+        }
         Update::CallbackQuery(cb) => {
             let tg = callback_to_callback(cb, client).await;
             let handlers = {

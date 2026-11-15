@@ -50,6 +50,16 @@ while true; do
     echo "$(date +%H:%M:%S) started tgapi"
   fi
 
+  # YouTube's proof-of-origin provider. Without it yt-dlp is refused even for
+  # public videos on a datacenter IP, which is what made "Play video" fail.
+  if command -v node >/dev/null 2>&1 && [ -f /root/bgutil/server/build/main.js ]; then
+    if ! pgrep -f "[b]gutil/server/build/main.js" >/dev/null; then
+      setsid node /root/bgutil/server/build/main.js --port 4416 \
+        >> logs/pot.log 2>&1 < /dev/null &
+      echo "$(date +%H:%M:%S) started pot"
+    fi
+  fi
+
   if ! pgrep -f "[t]ools/downloader.py" >/dev/null; then
     # The bot reaches this sidecar as the fallback Iota backend, so it has to
     # accept the Iota key as well as its own local one.

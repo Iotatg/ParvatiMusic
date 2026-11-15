@@ -632,8 +632,12 @@
     postTyping(false);
   }
 
+  let roomTitleCache = null;
   function renderRoom() {
-    $('#roomName').textContent = state.room.title;
+    const title = state.room.title;
+    if (title === roomTitleCache) return;
+    roomTitleCache = title;
+    $('#roomName').textContent = title;
   }
 
   /// Header of the chat tab: which group this chat belongs to, whether its
@@ -642,7 +646,7 @@
     const c = state.chat || {};
     const name = c.title || state.room?.title || 'Chat';
     const nameEl = $('#chatName');
-    if (nameEl) nameEl.textContent = name;
+    if (nameEl && nameEl.textContent !== name) nameEl.textContent = name;
     const dot = $('#csDot');
     if (dot) dot.classList.toggle('is-on', !!c.live);
     const list = state.chats || [];
@@ -650,8 +654,10 @@
       n + (String(x.id) === String(c.id) ? 0 : Math.max(0, +x.unread || 0)), 0);
     const badge = $('#chatBadge');
     if (badge) {
-      badge.hidden = other <= 0;
-      badge.textContent = other > 99 ? '99+' : String(other);
+      const txt = other > 99 ? '99+' : String(other);
+      const hide = other <= 0;
+      if (badge.hidden !== hide) badge.hidden = hide;
+      if (badge.textContent !== txt) badge.textContent = txt;
     }
     const sw = $('#chatSwitch');
     if (sw) sw.title = `${list.length || 1} chat${(list.length || 1) === 1 ? '' : 's'} · tap to switch`;
@@ -743,7 +749,15 @@
   const pendingTrack = () => state.playback.pending || null;
   const displayTrack = () => currentTrack() || pendingTrack();
 
+  let lastSoftNotice = 0;
   function renderSong(force = false) {
+    // A video tap that had to fall back to audio is announced exactly once;
+    // the server keeps the notice until the next successful play.
+    const pe = state.playback.error;
+    if (pe && pe.soft && +pe.at && +pe.at !== lastSoftNotice) {
+      lastSoftNotice = +pe.at;
+      toast(pe.error || 'Playing audio', 'warn');
+    }
     const t = currentTrack();
     const p = pendingTrack();
     const shown = t || p;
@@ -947,26 +961,46 @@
     $('#sleepLabel').textContent = s > 0 ? `Sleep ${fmt(s)}` : 'Sleep';
   }
 
+  // The ticker runs four times a second. Writing the same width/left/text
+  // back into the DOM each time forces a style/layout pass for no visual
+  // change, which is exactly what makes a long session feel heavy.
+  let lastProgPct = -1;
+  let lastProgSec = -1;
   function paintProgress() {
     const t = currentTrack();
     if (!t) return;
     const pct = clamp((localPos / t.duration) * 100, 0, 100);
-    $('#seekFill').style.width = `${pct}%`;
-    $('#seekKnob').style.left = `${pct}%`;
-    $('#timeNow').textContent = fmt(localPos);
-    $('#miniFill').style.width = `${pct}%`;
-    const nowPos = $('#qNowPos');
-    if (nowPos) nowPos.textContent = fmt(localPos);
+    if (Math.abs(pct - lastProgPct) >= 0.15) {
+      lastProgPct = pct;
+      $('#seekFill').style.width = `${pct}%`;
+      $('#seekKnob').style.left = `${pct}%`;
+      $('#miniFill').style.width = `${pct}%`;
+    }
+    const sec = Math.floor(localPos);
+    if (sec !== lastProgSec) {
+      lastProgSec = sec;
+      $('#timeNow').textContent = fmt(localPos);
+      const nowPos = $('#qNowPos');
+      if (nowPos) nowPos.textContent = fmt(localPos);
+    }
     if (videoBound) syncVideo();
     if (audioBound) syncAudio();
   }
 
+  let miniSrc = '';
+  let miniTitle = '';
+  let miniIcon = '';
   function renderMini() {
     const t = displayTrack();
     if (!t) return;
-    $('#miniArt').src = t.art || coverURI(t.title);
-    $('#miniTitle').textContent = t.title;
-    $('#miniIcon').querySelector('use').setAttribute('href', state.playback.paused ? '#i-play' : '#i-pause');
+    const src = t.art || coverURI(t.title);
+    if (src !== miniSrc) { miniSrc = src; $('#miniArt').src = src; }
+    if (t.title !== miniTitle) { miniTitle = t.title; $('#miniTitle').textContent = t.title; }
+    const ic = state.playback.paused ? '#i-play' : '#i-pause';
+    if (ic !== miniIcon) {
+      miniIcon = ic;
+      $('#miniIcon').querySelector('use').setAttribute('href', ic);
+    }
     paintProgress();
   }
 
@@ -1646,11 +1680,20 @@
     return (m ? m[0] : '?').toUpperCase();
   }
 
+  let chatRowsSig = '';
   function renderChatRows() {
     const box = $('#chatRows');
     if (!box) return;
     const list = state.chats || [];
     const curId = String(state.chat?.id || '');
+    // The sheet stays mounted while open; a state frame that changes nothing
+    // visible (a playhead tick, another member's heartbeat) must not rebuild
+    // the whole list under the user's finger.
+    const rowSig = JSON.stringify([curId, list.map(c => [
+      c.id, c.title, c.unread, c.live, c.members, c.last_text, c.last_ts,
+    ])]);
+    if (rowSig === chatRowsSig) return;
+    chatRowsSig = rowSig;
     const cur = list.find(c => String(c.id) === curId) || {};
     const name = cur.title || state.room?.title || 'Chat';
     const subLine = $('#chatsSub');
@@ -2420,8 +2463,14 @@
       : m.kind === 'photo' ? 'Photo'
       : m.kind === 'voice' ? 'Voice message'
       : (m.text || '').slice(0, 90);
-    replyTarget = { mid: m.mid || 0, name: m.name, text: snippet };
-    $('#replyTo').textContent = m.name;
+    // A message can arrive without a display name (service rows, a cold
+    // roster). The quote header used to go blank in that case, which looked
+    // like "reply to nobody"; fall back to @username, then a neutral label.
+    const who = (m.name || '').trim()
+      || (m.username ? `@${m.username}` : '')
+      || 'message';
+    replyTarget = { mid: m.mid || 0, name: who, text: snippet };
+    $('#replyTo').textContent = who;
     $('#replyText').textContent = snippet;
     $('#replyBar').classList.add('is-on');
     editor().focus();

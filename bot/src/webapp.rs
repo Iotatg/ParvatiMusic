@@ -280,6 +280,35 @@ pub fn install_assistants(a: Arc<AssistantManager>) {
     let _ = ASSISTS.set(a);
 }
 
+/// Send a text message through a *user* session when the verified viewer is
+/// that session's account. Bot API messages are always authored by the bot;
+/// the only way to speak as the person who opened the app is to use their own
+/// MTProto session. Viewers without a session fall back to the bot (the
+/// message is still attributed to them inside the mini app).
+fn send_as_assistant(auth: &Auth, chat: i64, text: &str, reply: i64) -> Option<i64> {
+    let uid = auth.user_id?;
+    let assists = ASSISTS.get()?;
+    let mut index = 0usize;
+    assists.for_each(|a| {
+        if a.user_id == uid {
+            index = a.index;
+        }
+    });
+    if index == 0 {
+        return None;
+    }
+    let a = assists.get(index)?;
+    let mut ctx = a.ntg();
+    let mt = ctx.mt_mut()?;
+    // `send_text` parses a small HTML subset; escape the user's text so a
+    // literal `<b>` is not silently turned into markup.
+    let safe = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    mt.send_text(chat, &safe, reply, None).ok()
+}
+
 /// Ids of every participant of the mirrored group, via the assistant session.
 fn participant_ids(chat: i64) -> Vec<i64> {
     let Some(assists) = ASSISTS.get() else {
@@ -435,6 +464,18 @@ fn tg_json(path: &str) -> Option<Value> {
         return None;
     }
     serde_json::from_slice(&body).ok()
+}
+
+/// Bot API wording for "this bot is no longer in that group". A kicked bot
+/// stops receiving updates, so the MTProto membership event may never arrive
+/// (especially across a restart); every roster pass checks this explicitly.
+fn bot_is_out(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("kicked")
+        || e.contains("chat not found")
+        || e.contains("bot is not a member")
+        || e.contains("not a member of the chat")
+        || e.contains("chat_id is empty")
 }
 
 /// Turn one Bot API member object into a roster row: role, tag list and the
@@ -987,18 +1028,47 @@ impl MiniApp {
     /// otherwise the most recently updated live room — so the mini app follows
     /// whatever voice chat the bot is actually playing in instead of a fixed id.
     fn active_chat(&self) -> i64 {
-        if self.rooms.room_for(self.chat_id).is_some() {
+        // A group the bot was removed from can still hold a stale room for a
+        // few seconds; it must not keep the whole app pointed at a chat that
+        // is no longer reachable.
+        let left: std::collections::HashSet<i64> = self
+            .chat_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, r)| r["left"].as_bool() == Some(true))
+            .map(|(id, _)| *id)
+            .collect();
+        if self.rooms.room_for(self.chat_id).is_some() && !left.contains(&self.chat_id) {
             return self.chat_id;
         }
         let mut best: Option<(i64, i64)> = None;
         for (id, room) in self.rooms.all_rooms() {
+            if left.contains(&id) {
+                continue;
+            }
             let g = room.lock().unwrap_or_else(|e| e.into_inner());
             let stamp = g.updated_at.max(g.position);
             if best.map(|(_, s)| stamp > s).unwrap_or(true) {
                 best = Some((id, stamp));
             }
         }
-        best.map(|(id, _)| id).unwrap_or(self.chat_id)
+        if let Some((id, _)) = best {
+            return id;
+        }
+        // No live room: the configured chat is still the default unless the
+        // bot has been removed from it.
+        if !left.contains(&self.chat_id) {
+            return self.chat_id;
+        }
+        // Otherwise fall back to the most recent group that is still
+        // reachable, so "switch chat" keeps working after the bot is kicked.
+        let meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.iter()
+            .filter(|(id, r)| !left.contains(*id) && r["left"].as_bool() != Some(true))
+            .max_by_key(|(_, r)| r["last_date"].as_i64().unwrap_or(0))
+            .map(|(id, _)| *id)
+            .unwrap_or(self.chat_id)
     }
 
     fn room(&self) -> Option<Arc<Mutex<RoomState>>> {
@@ -1410,7 +1480,70 @@ impl MiniApp {
         self.active_chat()
     }
 
+    /// Groups the bot/assistant has been removed from. They keep their
+    /// mirrored history on disk, but must never show up in the switcher, be
+    /// selectable, or accept a message again.
+    fn is_left(&self, chat: i64) -> bool {
+        self.chat_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chat)
+            .and_then(|r| r["left"].as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Mark a group as left without destroying its history. A later re-invite
+    /// clears the flag in `touch_chat`, so the same chat comes back with its
+    /// old messages instead of starting empty.
+    fn mark_chat_left(&self, chat: i64) {
+        if chat == 0 {
+            return;
+        }
+        {
+            let mut meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+            let row = meta.entry(chat).or_insert_with(|| {
+                json!({ "id": chat.to_string(), "title": format!("Chat {chat}"), "kind": "group" })
+            });
+            row["left"] = json!(true);
+            row["live"] = json!(false);
+        }
+        self.view_chat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, id| *id != chat);
+        let suffix = format!(":{chat}");
+        self.last_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.ends_with(&suffix));
+        self.save_chats();
+    }
+
+    /// The bot was re-added to a group it had left: bring the same chat (and
+    /// its old history) back into the switcher instead of starting a new one.
+    fn mark_chat_joined(&self, chat: i64) {
+        if chat == 0 {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut meta = self.chat_meta.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(row) = meta.get_mut(&chat) {
+                if row["left"].as_bool() == Some(true) {
+                    row["left"] = json!(false);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save_chats();
+        }
+    }
+
     fn chat_known(&self, id: i64) -> bool {
+        if self.is_left(id) {
+            return false;
+        }
         id == self.chat_id
             || self.rooms.room_for(id).is_some()
             || self
@@ -2034,6 +2167,11 @@ impl MiniApp {
         }
         let mut rows: Vec<Value> = Vec::new();
         for (id, mut r) in src {
+            // A group the bot was removed from keeps its mirror on disk but
+            // is not a chat you can open or switch to any more.
+            if r["left"].as_bool() == Some(true) {
+                continue;
+            }
             r["id"] = json!(id.to_string());
             if r["title"].as_str().unwrap_or("").trim().is_empty() {
                 r["title"] = json!(if id == self.chat_id {
@@ -2051,8 +2189,12 @@ impl MiniApp {
             });
             rows.push(r);
         }
-        // The configured chat always exists, even before its first message.
-        if !rows.iter().any(|r| r["id"].as_str() == Some(active.to_string().as_str())) {
+        // The configured chat always exists, even before its first message —
+        // unless the bot has been removed from it, in which case the switcher
+        // must not resurrect a dead group.
+        if !self.is_left(active)
+            && !rows.iter().any(|r| r["id"].as_str() == Some(active.to_string().as_str()))
+        {
             let title = self.title.lock().unwrap_or_else(|e| e.into_inner()).clone();
             rows.push(json!({
                 "id": active.to_string(),
@@ -2430,7 +2572,23 @@ impl MiniApp {
         let chat = self.active_chat();
         let hosts = host_ids();
 
-        if let Some(info) = tg_json(&format!("/chat?chat_id={chat}")) {
+        // One call gives both the metadata and the membership verdict. A
+        // kicked bot is invisible to `/admins` and `/member`; without this
+        // check its chat stayed in the switcher forever with zero members.
+        let mut chat_info: Option<Value> = None;
+        if let Some((code, _, body)) = tg_call("GET", &format!("/chat?chat_id={chat}"), None) {
+            let v: Value =
+                serde_json::from_slice(&body).unwrap_or_else(|_| json!({ "error": "bad gateway" }));
+            if code == 200 {
+                chat_info = Some(v);
+            } else if bot_is_out(v["error"].as_str().unwrap_or("")) {
+                self.mark_chat_left(chat);
+                self.roster_busy.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+
+        if let Some(info) = chat_info {
             if let Some(t) = info["title"].as_str() {
                 if !t.is_empty() {
                     *self.title.lock().unwrap_or_else(|e| e.into_inner()) = t.to_string();
@@ -2558,7 +2716,10 @@ impl MiniApp {
         // message now lands in its own per-chat queue instead of one shared
         // timeline.
         let chat = ev.chat_id;
-        if chat == 0 {
+        if chat == 0 || self.is_left(chat) {
+            // An assistant can still see a group for a moment after the bot
+            // was kicked; mirroring those frames would resurrect a chat the
+            // switcher has already dropped.
             return;
         }
         self.touch_chat(chat, None, None);
@@ -2878,13 +3039,39 @@ fn start_track_async(chat_id: i64, rooms: Rooms, track: Track, force: bool) {
                 pick = alt;
             }
         }
-        let (path, err) = download(&pick);
-        // "Play video" must always be the real clip. The downloader walks its
-        // player-client chain and merges a 720p H.264 video stream with its
-        // audio for this exact id; if that still fails we report the error
-        // instead of silently switching to audio or generating a cover
-        // slideshow. Never substitute a different song — that is what made
-        // every tap play the first result of the list.
+        let mut path;
+        let mut err;
+        let mut video_fallback = false;
+        if pick.video {
+            let (p, e) = download(&pick);
+            path = p;
+            err = e;
+            if path.is_empty() {
+                // A video source can refuse this host (YouTube's bot check)
+                // while the very same song is still available as audio. Play
+                // the song instead of leaving a dead tap, and tell the user
+                // the picture is missing rather than pretending it worked.
+                let mut audio = pick.clone();
+                audio.video = false;
+                let (p2, e2) = download(&audio);
+                if !p2.is_empty() {
+                    pick = audio;
+                    path = p2;
+                    err = String::new();
+                    video_fallback = true;
+                } else {
+                    err = format!("video: {err}; audio: {e2}");
+                }
+            }
+        } else {
+            let (p, e) = download(&pick);
+            path = p;
+            err = e;
+        }
+        // "Play video" must always be the real clip when one is reachable.
+        // Never substitute a different song — that is what made every tap play
+        // the first result of the list. Audio of the *same* track is the only
+        // acceptable fallback, and it is announced to the client.
         let Some(app) = app() else { return };
         if path.is_empty() {
             note(
@@ -2912,7 +3099,18 @@ fn start_track_async(chat_id: i64, rooms: Rooms, track: Track, force: bool) {
             &format!("play {} → {path}", pick.title),
         );
         clear_pending(&app);
-        *app.play_error.lock().unwrap_or_else(|e| e.into_inner()) = Value::Null;
+        *app.play_error.lock().unwrap_or_else(|e| e.into_inner()) = if video_fallback {
+            // A soft notice, not a failure: the song is playing, only the
+            // picture is missing. The client shows it as a warning toast.
+            json!({
+                "title": pick.title,
+                "soft": true,
+                "error": "Video source unavailable — playing audio",
+                "at": now_secs(),
+            })
+        } else {
+            Value::Null
+        };
         // The mini app can start playback before any chat command created the
         // room, so create it on demand instead of dropping the track.
         let room = rooms.create_room(chat_id, true);
@@ -4034,6 +4232,26 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             // message and the bubble would flicker or duplicate.
             let client_id = body["clientId"].as_str().unwrap_or("").chars().take(64).collect::<String>();
 
+            // The reply quote has to survive the round-trip. It used to be
+            // sent to Telegram and then dropped from the echoed/ mirrored
+            // message, so a swipe-to-reply bubble lost its quote as soon as
+            // the SSE frame replaced the optimistic row. Resolve it from the
+            // local mirror first, then fall back to the client's copy (which
+            // is all we have for a local-only bubble with mid 0).
+            let reply_ref = if reply != 0 {
+                app.chat_msgs_for(target, reply)
+                    .map(|m| {
+                        json!({
+                            "mid": reply,
+                            "name": m["name"].as_str().unwrap_or(""),
+                            "text": m["text"].as_str().unwrap_or(""),
+                        })
+                    })
+                    .or_else(|| body.get("reply").cloned().filter(|v| v.is_object()))
+            } else {
+                body.get("reply").cloned().filter(|v| v.is_object())
+            };
+
             // Idempotency: a response lost on a flaky mobile network makes the
             // client retry with the same client id. Replay the first result
             // instead of posting the message to Telegram a second time.
@@ -4046,6 +4264,44 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     return (409, json!({ "error": "send already in progress" }));
                 }
                 Ok(None) => {}
+            }
+
+            // Speak as the viewer when they own an assistant session: a bot
+            // token can only ever post as the bot, so this is the one path
+            // that makes the Telegram group show the real account. Everyone
+            // else keeps the bot transport and is attributed in-app.
+            if kind == "text" && !text.trim().is_empty() {
+                if let Some(mid) = send_as_assistant(&auth, target, &text, reply) {
+                    let sender_id =
+                        auth.me(body["senderId"].as_str().unwrap_or("").to_string());
+                    let sender_name = auth
+                        .display_name(body["senderName"].as_str().unwrap_or("you").to_string());
+                    let msg = json!({
+                        "id": format!("l{mid}"),
+                        "clientId": client_id,
+                        "mid": mid,
+                        "from": sender_id,
+                        "name": sender_name,
+                        "photo": format!("/api/avatar/{sender_id}"),
+                        "tags": body.get("tags").cloned().unwrap_or(json!([])),
+                        "mine": false,
+                        "kind": kind.clone(),
+                        "text": text.clone(),
+                        "entities": entities.clone(),
+                        "emoji": body["emoji"].as_str().unwrap_or(""),
+                        "media": body["media"].as_str()
+                            .or_else(|| body["thumb"].as_str())
+                            .unwrap_or(""),
+                        "media_kind": body["media_kind"].as_str().unwrap_or(""),
+                        "reply": reply_ref.clone(),
+                        "ts": now_hm(),
+                        "date": now_secs() as i64,
+                        "as_user": true,
+                    });
+                    app.push_message(target, msg.clone());
+                    app.send_finish(dedupe_uid, target, &client_id, Some(&msg));
+                    return (200, json!({ "ok": true, "message": msg, "as_user": true }));
+                }
             }
 
             // Preview/seed path: store the message for this instance only.
@@ -4074,6 +4330,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     "media_kind": body["media_kind"].as_str()
                         .unwrap_or(if kind == "sticker" { "image" } else { "" }),
                     "sticker": body["thumb"].as_str().unwrap_or(""),
+                    "reply": reply_ref,
                     "ts": now_hm(),
                     "date": now_secs() as i64,
                     "reacts": body.get("reacts").cloned().unwrap_or(json!([])),
@@ -4111,6 +4368,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                             .unwrap_or(""),
                         "media_kind": body["media_kind"].as_str()
                             .unwrap_or(if kind == "sticker" { "image" } else { "" }),
+                        "reply": reply_ref,
                         "ts": now_hm(),
                         "date": res["date"].as_i64().unwrap_or(now_secs() as i64),
                     });
@@ -4319,9 +4577,16 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 tg_post("/leave", &json!({ "chat_id": target.to_string() })),
                 Some((code, _)) if code == 200
             );
-            // The configured home chat is only cleared (the switcher must keep
-            // the room the app is bound to); other groups are fully forgotten.
-            app.forget_chat(target);
+            // The bot is out of this group either way. Keep the mirror on disk
+            // (a re-invite restores the history) but hide the chat from the
+            // switcher, and let the app fall back to a reachable group. The
+            // configured home chat is only cleared: it is the room the app is
+            // bound to, so it may come back if the bot is re-added.
+            if target == app.chat_id {
+                app.clear_chat(target);
+            } else {
+                app.mark_chat_left(target);
+            }
             return (
                 200,
                 json!({
@@ -4784,10 +5049,28 @@ pub fn ingest(ev: ChatEvent) {
 /// True when the mini app is mirroring `chat_id` (lets the bot skip work).
 pub fn tracks_chat(chat_id: i64) -> bool {
     // Every group the bot is in is tracked; each one gets its own chat.
-    // Only the zero id (non-group updates) is refused.
+    // Only the zero id (non-group updates) is refused, and a group the bot
+    // was removed from stops mirroring immediately.
     match app() {
-        Some(_) => chat_id != 0,
+        Some(hub) => chat_id != 0 && !hub.is_left(chat_id),
         None => false,
+    }
+}
+
+/// The bot (or an assistant) was removed from a group: hide its chat, keep
+/// its history on disk, and let the switcher fall back to a reachable group.
+pub fn mark_chat_left(chat_id: i64) {
+    if let Some(hub) = app() {
+        hub.mark_chat_left(chat_id);
+        crate::parv_info!("miniapp", "left group {chat_id}; chat hidden from the switcher");
+    }
+}
+
+/// The bot was added back to a group: un-hide its existing chat.
+pub fn mark_chat_joined(chat_id: i64) {
+    if let Some(hub) = app() {
+        hub.mark_chat_joined(chat_id);
+        crate::parv_info!("miniapp", "rejoined group {chat_id}; chat restored");
     }
 }
 
@@ -5525,6 +5808,71 @@ mod chat_tests {
         let plain = viewer(42);
         let (code, _) = route_api(&app, &post("/api/members/refresh", json!({})), &plain);
         assert_eq!(code, 200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_left_group_disappears_from_the_switcher_and_rejoins_cleanly() {
+        let (app, dir) = app();
+        app.chat_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(OTHER, json!({ "id": OTHER.to_string(), "title": "Other", "last_date": 10 }));
+        app.push_message(OTHER, msg(1, "11", "hello there", 10));
+        assert!(app.chat_known(OTHER));
+        assert!(app
+            .chat_list(None)
+            .iter()
+            .any(|r| r["id"].as_str() == Some(OTHER.to_string().as_str())));
+
+        // Kicked: the chat must vanish from the switcher and stop accepting
+        // selections, but its mirrored history stays on disk.
+        app.mark_chat_left(OTHER);
+        assert!(!app.chat_known(OTHER), "a left group is not selectable");
+        assert!(
+            app.chat_list(None)
+                .iter()
+                .all(|r| r["id"].as_str() != Some(OTHER.to_string().as_str())),
+            "a left group must not be listed"
+        );
+        assert_eq!(app.chat_msgs(OTHER).len(), 1, "history survives");
+
+        // Re-invited: the same chat (and its history) comes back.
+        app.mark_chat_joined(OTHER);
+        assert!(app.chat_known(OTHER));
+        assert!(app
+            .chat_list(None)
+            .iter()
+            .any(|r| r["id"].as_str() == Some(OTHER.to_string().as_str())));
+        assert_eq!(app.chat_msgs(OTHER).len(), 1, "rejoin keeps the history");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_send_keeps_the_reply_quote() {
+        let (app, dir) = app();
+        let auth = viewer(7);
+        let (code, out) = route_api(
+            &app,
+            &post(
+                "/api/chat/send",
+                json!({
+                    "kind": "text",
+                    "text": "reply body",
+                    "local": true,
+                    "clientId": "reply-local-1",
+                    "reply": { "mid": 5, "name": "Ada", "text": "hello" },
+                }),
+            ),
+            &auth,
+        );
+        assert_eq!(code, 200);
+        // The quote used to be dropped from the echoed message, so the bubble
+        // lost its header as soon as the server frame replaced the optimistic
+        // row. A local send has no mirror to resolve, so the client's copy is
+        // the authoritative one.
+        assert_eq!(out["message"]["reply"]["name"], "Ada");
+        assert_eq!(out["message"]["reply"]["text"], "hello");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
