@@ -1828,6 +1828,34 @@ impl Client {
         }
     }
 
+    /// Resolve a channel that has not produced an update yet and cache its
+    /// access hash, so a session that is a member can send to a group before
+    /// the first message from it arrives.
+    fn ensure_peer(&mut self, chat_id: i64) -> Result<(), String> {
+        if self.msg.peers.contains_key(&chat_id) {
+            return Ok(());
+        }
+        let (id, access_hash) = self.resolve_channel(chat_id)?;
+        // The update cache is keyed by the marked -100 id; the resolver also
+        // knows the bare channel id, so keep both in sync.
+        self.msg.peers.insert(
+            chat_id,
+            PeerInfo {
+                kind: crc227::INPUT_PEER_CHANNEL,
+                access_hash,
+                megagroup: true,
+                classified: true,
+            },
+        );
+        self.msg.peers.entry(id).or_insert(PeerInfo {
+            kind: crc227::INPUT_PEER_CHANNEL,
+            access_hash,
+            megagroup: true,
+            classified: true,
+        });
+        Ok(())
+    }
+
     /// send_text: fire-and-forget sendMessage; returns the new message id
     /// (0 when the server updates stream did not confirm in time).
     pub fn send_text(
@@ -1851,6 +1879,9 @@ impl Client {
             flags |= 1 << 3;
         }
         w.u32(flags);
+        if !self.msg.peers.contains_key(&chat_id) {
+            let _ = self.ensure_peer(chat_id);
+        }
         self.write_peer(&mut w, chat_id)?;
         if reply_to > 0 {
             w.u32(crc227::INPUT_REPLY_TO_MESSAGE);
@@ -1928,6 +1959,9 @@ impl Client {
         }
         flags |= 1 << 11; // message
         w.u32(flags);
+        if !self.msg.peers.contains_key(&chat_id) {
+            let _ = self.ensure_peer(chat_id);
+        }
         self.write_peer(&mut w, chat_id)?;
         w.i32(message_id as i32);
         w.str(&plain);
@@ -2043,6 +2077,9 @@ impl Client {
     pub fn set_typing_choosing_sticker(&mut self, chat_id: i64) -> Result<bool, String> {
         let mut w = TlWriter::new();
         w.u32(crc227::MESSAGES_SET_TYPING);
+        if !self.msg.peers.contains_key(&chat_id) {
+            let _ = self.ensure_peer(chat_id);
+        }
         self.write_peer(&mut w, chat_id)?;
         w.u32(crc227::SEND_MESSAGE_CHOOSE_STICKER_ACTION);
         let resp = self.call_rpc(w.out(), true, false)?;
@@ -2061,6 +2098,9 @@ impl Client {
         let mut w = TlWriter::new();
         w.u32(crc227::MESSAGES_EDIT_MESSAGE);
         w.u32(1 << 2); // reply_markup flag
+        if !self.msg.peers.contains_key(&chat_id) {
+            let _ = self.ensure_peer(chat_id);
+        }
         self.write_peer(&mut w, chat_id)?;
         w.i32(message_id as i32);
         write_markup(&mut w, markup);
@@ -2086,6 +2126,9 @@ impl Client {
             flags |= 1;
         }
         w.u32(flags);
+        if !self.msg.peers.contains_key(&chat_id) {
+            let _ = self.ensure_peer(chat_id);
+        }
         self.write_peer(&mut w, chat_id)?;
         if reply_to > 0 {
             w.u32(crc227::INPUT_REPLY_TO_MESSAGE);

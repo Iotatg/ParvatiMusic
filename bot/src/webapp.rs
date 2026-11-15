@@ -229,6 +229,13 @@ pub struct MiniApp {
     /// state stream carries the list, so every open client can paint the
     /// "typing…" bubble without a second socket or a poll.
     typing: Mutex<HashMap<(i64, i64), (String, u64)>>,
+    /// Per-group verdict for sending through the assistant account:
+    /// `chat id -> (expiry, usable)`. A bot token can only post as the bot,
+    /// so the real user account is the only transport that makes the group
+    /// show a person. When the assistant is not a member of a group the RPC
+    /// fails; remembering that for a few minutes avoids a stall on every
+    /// message while still retrying after the assistant is added.
+    send_via: Mutex<HashMap<i64, (u64, bool)>>,
     /// Optional shared secret (`MINIAPP_TOKEN`) for trusted integrations. It
     /// never grants a *user* identity — only the control plane.
     token: String,
@@ -280,24 +287,85 @@ pub fn install_assistants(a: Arc<AssistantManager>) {
     let _ = ASSISTS.set(a);
 }
 
-/// Send a text message through a *user* session when the verified viewer is
-/// that session's account. Bot API messages are always authored by the bot;
-/// the only way to speak as the person who opened the app is to use their own
-/// MTProto session. Viewers without a session fall back to the bot (the
-/// message is still attributed to them inside the mini app).
-fn send_as_assistant(auth: &Auth, chat: i64, text: &str, reply: i64) -> Option<i64> {
-    let uid = auth.user_id?;
+/// Human label for the first assistant account (`@name`, or `account 123`
+/// when it has no username). Resolved once; empty when no session exists.
+fn assistant_account() -> String {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let Some(assists) = ASSISTS.get() else {
+            return String::new();
+        };
+        let Some(a) = assists.first() else {
+            return String::new();
+        };
+        let id = a.user_id;
+        let mut ctx = a.ntg();
+        let username = match ctx.mt_mut() {
+            Some(mt) => mt.self_username().unwrap_or_default(),
+            None => String::new(),
+        };
+        if username.is_empty() {
+            if id == 0 {
+                String::new()
+            } else {
+                format!("account {id}")
+            }
+        } else {
+            format!("@{username}")
+        }
+    })
+    .clone()
+}
+
+/// Send a text message through a *user* session. Bot API messages are always
+/// authored by the bot, so a real MTProto account is the only transport that
+/// makes the Telegram group show a person instead of `@…bot`.
+///
+/// The viewer's own session is preferred when they own one. Otherwise the
+/// first assistant account speaks for them: the app still attributes the
+/// message to the verified viewer (author, avatar, permissions), which is the
+/// most a bot token can do. A failed attempt is remembered per group for a
+/// few minutes so a group the assistant cannot write to does not add an RPC
+/// stall to every message.
+fn send_as_assistant(
+    app: &MiniApp,
+    auth: &Auth,
+    chat: i64,
+    text: &str,
+    reply: i64,
+) -> Option<(i64, i64)> {
     let assists = ASSISTS.get()?;
-    let mut index = 0usize;
+    let uid = auth.user_id.unwrap_or(0);
+    let mut exact = 0usize;
     assists.for_each(|a| {
-        if a.user_id == uid {
-            index = a.index;
+        if uid != 0 && a.user_id == uid {
+            exact = a.index;
         }
     });
-    if index == 0 {
+    // The fallback account is shared: using it for every member would show
+    // one person's name on everybody's messages. Only the owner (the account
+    // that runs the bot) may borrow it; everyone else keeps the bot transport
+    // and their in-app identity.
+    if exact == 0 && !app.is_owner(auth) {
         return None;
     }
-    let a = assists.get(index)?;
+    if let Some((expiry, ok)) = app
+        .send_via
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&chat)
+        .copied()
+    {
+        if !ok && now_secs() < expiry {
+            return None;
+        }
+    }
+
+    let a = if exact != 0 {
+        assists.get(exact)
+    } else {
+        assists.first()
+    }?;
     let mut ctx = a.ntg();
     let mt = ctx.mt_mut()?;
     // `send_text` parses a small HTML subset; escape the user's text so a
@@ -306,7 +374,26 @@ fn send_as_assistant(auth: &Auth, chat: i64, text: &str, reply: i64) -> Option<i
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
-    mt.send_text(chat, &safe, reply, None).ok()
+    match mt.send_text(chat, &safe, reply, None) {
+        Ok(mid) => {
+            app.send_via
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(chat, (0, true));
+            Some((mid, a.user_id))
+        }
+        Err(e) => {
+            crate::parv_info!(
+                "miniapp",
+                "assistant send to {chat} unavailable: {e}; using the bot transport"
+            );
+            app.send_via
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(chat, (now_secs() + 180, false));
+            None
+        }
+    }
 }
 
 /// Ids of every participant of the mirrored group, via the assistant session.
@@ -610,6 +697,7 @@ pub fn install(rooms: Rooms) {
         roster_busy: AtomicBool::new(false),
         send_dedupe: Mutex::new(HashMap::new()),
         typing: Mutex::new(HashMap::new()),
+        send_via: Mutex::new(HashMap::new()),
         token: env_str("MINIAPP_TOKEN", ""),
         bot_token: {
             let t = env_str("TOKEN", "");
@@ -1714,7 +1802,24 @@ impl MiniApp {
             if let Some(mid) = msg.get("mid").and_then(|v| v.as_i64()) {
                 if mid != 0 {
                     if let Some(slot) = q.iter_mut().find(|m| m["mid"].as_i64() == Some(mid)) {
-                        *slot = msg;
+                        // A message we posted through the assistant account
+                        // comes back through the bot as a normal user message
+                        // authored by that account. Keep the viewer's
+                        // attribution from the optimistic row (author, avatar,
+                        // tags) and only take the transport's payload.
+                        if slot["as_user"].as_bool() == Some(true)
+                            && msg["as_user"].as_bool() != Some(true)
+                        {
+                            let mut merged = msg.clone();
+                            for k in ["from", "name", "photo", "tags", "mine", "as_user", "via"] {
+                                if let Some(v) = slot.get(k) {
+                                    merged[k] = v.clone();
+                                }
+                            }
+                            *slot = merged;
+                        } else {
+                            *slot = msg;
+                        }
                         drop(map);
                         self.save_chat(chat);
                         return;
@@ -2706,6 +2811,13 @@ impl MiniApp {
 
     fn roster_age(&self) -> u64 {
         now_secs().saturating_sub(*self.roster_at.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// True while a roster pass is running. A slow pass (MTProto retries on a
+    /// hidden member list) used to leave `roster_age` old, so every tap
+    /// spawned another thread; the in-flight flag is the real cooldown.
+    fn roster_busy_now(&self) -> bool {
+        self.roster_busy.load(Ordering::SeqCst)
     }
 
     /* ── incoming chat ── */
@@ -4266,12 +4378,12 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                 Ok(None) => {}
             }
 
-            // Speak as the viewer when they own an assistant session: a bot
-            // token can only ever post as the bot, so this is the one path
-            // that makes the Telegram group show the real account. Everyone
-            // else keeps the bot transport and is attributed in-app.
+            // Speak through a real user account: a bot token can only ever
+            // post as the bot, so this is the one path that makes the Telegram
+            // group show a person. The message is still attributed to the
+            // verified viewer in-app; `via` records which account carried it.
             if kind == "text" && !text.trim().is_empty() {
-                if let Some(mid) = send_as_assistant(&auth, target, &text, reply) {
+                if let Some((mid, via)) = send_as_assistant(&app, &auth, target, &text, reply) {
                     let sender_id =
                         auth.me(body["senderId"].as_str().unwrap_or("").to_string());
                     let sender_name = auth
@@ -4297,10 +4409,14 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                         "ts": now_hm(),
                         "date": now_secs() as i64,
                         "as_user": true,
+                        "via": via.to_string(),
                     });
                     app.push_message(target, msg.clone());
                     app.send_finish(dedupe_uid, target, &client_id, Some(&msg));
-                    return (200, json!({ "ok": true, "message": msg, "as_user": true }));
+                    return (
+                        200,
+                        json!({ "ok": true, "message": msg, "as_user": true, "via": via.to_string() }),
+                    );
                 }
             }
 
@@ -4348,6 +4464,8 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     let sender_name =
                         auth.display_name(body["senderName"].as_str().unwrap_or("you").to_string());
                     let mid = res["message_id"].as_i64().unwrap_or(0);
+                    let via_bot = kind == "text" && !text.trim().is_empty();
+                    let notify = via_bot && app.is_owner(&auth);
                     let msg = json!({
                         "id": format!("l{mid}"),
                         "clientId": client_id,
@@ -4374,7 +4492,15 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
                     });
                     app.push_message(target, msg.clone());
                     app.send_finish(dedupe_uid, target, &client_id, Some(&msg));
-                    (200, json!({ "ok": true, "message": msg }))
+                    let mut out = json!({
+                        "ok": true,
+                        "message": msg,
+                        "fallback": if notify { "bot" } else { "" },
+                    });
+                    if notify {
+                        out["fallback_account"] = json!(assistant_account());
+                    }
+                    (200, out)
                 }
                 Some((_, res)) => {
                     (502, json!({ "error": res["error"].as_str().unwrap_or("send failed") }))
@@ -4747,7 +4873,7 @@ fn route_api(app: &MiniApp, req: &Request, auth: &Auth) -> (u16, Value) {
             // Re-reading the public roster is safe for every verified viewer,
             // but it is an expensive Bot API pass. A short cooldown (plus the
             // existing `roster_busy` guard) keeps a burst of taps cheap.
-            if app.roster_age() < 10 {
+            if app.roster_busy_now() || app.roster_age() < 10 {
                 return (200, json!({ "ok": true, "throttled": true }));
             }
             if let Some(hub) = APP.get().cloned() {
@@ -5244,6 +5370,7 @@ mod chat_tests {
             roster_busy: AtomicBool::new(false),
             send_dedupe: Mutex::new(HashMap::new()),
             typing: Mutex::new(HashMap::new()),
+            send_via: Mutex::new(HashMap::new()),
             token: String::new(),
             bot_token: String::new(),
             allowed_ids: Vec::new(),
@@ -5873,6 +6000,41 @@ mod chat_tests {
         // the authoritative one.
         assert_eq!(out["message"]["reply"]["name"], "Ada");
         assert_eq!(out["message"]["reply"]["text"], "hello");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn mirrored_assistant_message_keeps_viewer_attribution() {
+        let dir = std::env::temp_dir().join(format!("parvati-asuser-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = app_in(HOME, dir.clone());
+        app.push_message(
+            HOME,
+            json!({
+                "id": "l77", "mid": 77, "from": "7", "name": "Ada",
+                "photo": "/api/avatar/7", "as_user": true, "via": "99",
+                "tags": [{"k": "admin", "label": "ADMIN"}],
+                "kind": "text", "text": "hello", "ts": "10:00", "date": 1
+            }),
+        );
+        // The same message comes back through the bot authored by the
+        // assistant account. The optimistic row already carries the viewer's
+        // identity; replacing it wholesale made the app show the assistant.
+        app.push_message(
+            HOME,
+            json!({
+                "id": "tg77", "mid": 77, "from": "99", "name": "Iota",
+                "photo": "/api/avatar/99",
+                "tags": [{"k": "member", "label": "MEMBER"}],
+                "kind": "text", "text": "hello", "ts": "10:00", "date": 1
+            }),
+        );
+        let row = app.chat_msgs_for(HOME, 77).expect("message");
+        assert_eq!(row["from"], "7");
+        assert_eq!(row["name"], "Ada");
+        assert_eq!(row["photo"], "/api/avatar/7");
+        assert_eq!(row["as_user"], true);
+        assert_eq!(row["via"], "99");
+        assert_eq!(row["tags"][0]["k"], "admin");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

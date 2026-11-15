@@ -382,6 +382,45 @@ impl Client {
         Ok((id, ah))
     }
 
+    /// Public @username of the signed-in account (empty when it has none).
+    /// Used by the mini app to tell the user which account has to be added to
+    /// a group before messages can be posted as a person instead of a bot.
+    pub fn self_username(&mut self) -> Result<String, String> {
+        let mut w = TlWriter::new();
+        w.u32(0x0d91a548); // users.getUsers
+        w.vec_header(1);
+        w.u32(0xf7c1b13f); // inputUserSelf
+        let resp = self.call_rpc(w.out(), true, false)?;
+        let Some(p) = find_crc(&resp, 0x31774388) else {
+            return Err("self user object not found".into());
+        };
+        if p + 24 > resp.len() {
+            return Err("self user truncated".into());
+        }
+        let mut r = TlReader::new(&resp[p + 4..]);
+        let flags = r.u32();
+        let _flags2 = r.u32();
+        let _id = r.i64();
+        if flags & 1 != 0 {
+            let _ah = r.i64();
+        }
+        if flags & (1 << 1) != 0 {
+            let _first = r.str();
+        }
+        if flags & (1 << 2) != 0 {
+            let _last = r.str();
+        }
+        let username = if flags & (1 << 3) != 0 {
+            String::from_utf8_lossy(r.str()).to_string()
+        } else {
+            String::new()
+        };
+        if !r.ok() {
+            return Err("self user truncated".into());
+        }
+        Ok(username)
+    }
+
     /// Start a voice chat in the channel (phone.createGroupCall).
     ///
     /// Telegram returns the new call inside an `Updates` container, so instead

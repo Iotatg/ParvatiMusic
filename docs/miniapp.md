@@ -895,10 +895,33 @@ neutral label when a row has no display name.
 **Who authors the message.** Bot API messages are always sent by the bot. When
 the verified viewer *is* one of the `STRING_SESSIONS` accounts, the message is
 sent through that account's own MTProto session (`send_text`), so the Telegram
-group shows the real person. Every other viewer keeps the bot transport and is
-attributed to their verified id inside the app (`from`, `name`, avatar,
-permissions); the app never claims the bot is the author. Text is HTML-escaped
-before `send_text` so a literal `<b>` is not turned into markup.
+group shows the real person. The owner may also borrow the first assistant
+account when they have no session of their own; the app still attributes the
+message to the verified viewer (`from`, `name`, avatar, permissions) and keeps
+that attribution when the mirrored copy arrives. The fallback is deliberately
+owner-only: lending one account to every member would print the same name on
+everybody's messages. A per-group `send_via` cache remembers a failed attempt
+for three minutes, so a group the assistant has not joined does not add an RPC
+stall to every message. In that case the owner gets one toast naming the
+account to add (`@name`, or `account <id>` when it has no username). Text is
+HTML-escaped before `send_text` so a literal `<b>` is not turned into markup.
+
+**The roster pages instead of painting everything.** The members tab renders
+30 rows, appends the next 30 when the list reaches the bottom (or on "Show
+more") and keeps the scroll offset across the repaint. The header reads
+`12 OF 91` when Telegram returns fewer rows than the group's member count, and
+a note under the search says why: some supergroups hide their member list from
+non-admins, and no client can enumerate it. The end-of-list button offers a
+throttled roster refresh (also available from the `•••` sheet) and reports the
+real visible count instead of promising rows that will never arrive.
+
+**One title, one badge.** The chat tab printed the group name twice — in the
+top room pill and again in the chat header — so the pill drops its title on
+that tab. `[hidden]` is now authoritative (`display:none !important`): class
+rules such as `.cs-badge{display:grid}` beat the UA rule, which is how a "0"
+unread badge stayed visible next to the name. A member's custom title that
+merely repeats a role tag ("OWNER" over an OWNER chip) is no longer printed a
+second time.
 
 **Video falls back to audio, not to a dead tap.** When a video source refuses
 this host (YouTube's bot check), the same track is downloaded as audio and
@@ -923,7 +946,7 @@ the app in a 401 loop after an auth change. Images keep a short 60 s cache.
 
 ### Regression coverage
 
-`cargo test --release --workspace` covers 47 unit tests, including the
+`cargo test --release --workspace` covers 48 unit tests, including the
 send-idempotency ledger (claim / replay / in-flight / release / empty key),
 `clientId` echo with verified-identity override, duplicate replay without a
 second row, saved-sticker sanitisation and corrupt-file quarantine, typing

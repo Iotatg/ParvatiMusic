@@ -1009,6 +1009,10 @@
   /// the next server tick to change the roster.
   let memberQuery = '';
   let membersSort = 'role';                 // role | name | voice
+  // The roster can be long; paint a page at a time so the tab opens fast and
+  // the rest arrives as the user scrolls (or taps "Show more").
+  let memberShown = 30;
+  let memberChat = '';                      // resets paging when the group changes
   const SORT_LABELS = { role: 'Role', name: 'Name', voice: 'In voice first' };
   const SORT_CYCLE = ['role', 'name', 'voice'];
 
@@ -1016,21 +1020,34 @@
     const total = state.room.members || state.members.length;
     const live = isLive();
     const q = memberQuery.trim().toLowerCase();
+    const chatKey = String(state.chat?.id || '');
+    if (chatKey !== memberChat) { memberChat = chatKey; memberShown = 30; }
     const all = q
       ? state.members.filter(m => [m.name, m.username, m.custom, m.id]
           .some(v => String(v || '').toLowerCase().includes(q)))
       : state.members.slice();
     const inVoice = live ? all.filter(m => m.vc) : [];
     const rest = all.filter(m => !inVoice.includes(m));
-    const sig = `${total}|${live}|${inVoice.length}|${q}|${membersSort}|` + all
+    const sig = `${total}|${live}|${inVoice.length}|${q}|${membersSort}|${memberShown}|` + all
       .map(m => `${m.id}:${m.vc ? 1 : 0}:${m.role}:${m.name}:${m.photo}:${m.username}:${(m.tags || []).map(t => t.k).join('.')}`)
       .join(',');
     if (!force && sig === lastSig.members) return;
     lastSig.members = sig;
 
+    const loaded = state.members.length;
     $('#membersLabel').textContent = q
       ? `MEMBERS · ${all.length} MATCH${all.length === 1 ? '' : 'ES'}`
-      : `MEMBERS · ${total} · ${inVoice.length} IN VOICE`;
+      : loaded < total
+        ? `MEMBERS · ${loaded} OF ${total} · ${inVoice.length} IN VOICE`
+        : `MEMBERS · ${total} · ${inVoice.length} IN VOICE`;
+    const note = $('#memberNote');
+    if (note) {
+      const missing = Math.max(0, total - loaded);
+      note.hidden = missing === 0 || !!q;
+      if (missing > 0 && !q) {
+        note.textContent = `${missing} members are hidden by this group's privacy setting`;
+      }
+    }
     const rank = { owner: 0, host: 1, admin: 2, member: 3 };
     const byName = (a, b) => String(a.name || '')
       .localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
@@ -1046,7 +1063,11 @@
 
     const row = (m) => {
       const mine = String(m.id) === String(viewer?.id);
-      const custom = m.custom && m.custom !== m.tags?.[0]?.label ? m.custom : '';
+      // A custom title that repeats a role tag ("OWNER" + OWNER) only adds
+      // noise; compare against every tag, not just the first one.
+      const custom = m.custom && !(m.tags || []).some(t =>
+        String(t.label || '').toLowerCase() === String(m.custom).toLowerCase())
+        ? m.custom : '';
       return `
       <div class="member" data-id="${esc(m.id)}" data-role="${esc(m.role)}">
         <div class="av-wrap">
@@ -1072,6 +1093,15 @@
       </div>`;
     };
 
+    // Page the roster instead of painting hundreds of rows in one go. The
+    // "in voice" section keeps its header and gets first claim on the budget.
+    const voiceRows = sort(inVoice);
+    const restRows = sort(rest);
+    const showVoice = voiceRows.slice(0, memberShown);
+    const showRest = restRows.slice(0, Math.max(0, memberShown - showVoice.length));
+    const shown = showVoice.length + showRest.length;
+    const left = all.length - shown;
+
     let html = '';
     if (q && !all.length) {
       html = `<div class="member-empty">
@@ -1080,19 +1110,63 @@
         <span>Nothing matches “${esc(memberQuery.trim())}”</span>
       </div>`;
     } else {
-      if (inVoice.length) {
-        html += `<div class="member-group"><b class="g-live">● In voice chat</b><span>${inVoice.length}</span><span class="g-line"></span></div>`;
-        html += sort(inVoice).map(row).join('');
+      if (showVoice.length) {
+        html += `<div class="member-group"><b class="g-live">● In voice chat</b><span>${voiceRows.length}</span><span class="g-line"></span></div>`;
+        html += showVoice.map(row).join('');
       }
-      html += `<div class="member-group"><b>Group members</b><span>${rest.length}</span><span class="g-line"></span></div>`;
-      html += sort(rest).map(row).join('');
-      if (!q && !rest.length) {
+      if (showRest.length || !q) {
+        html += `<div class="member-group"><b>Group members</b><span>${restRows.length}</span><span class="g-line"></span></div>`;
+        html += showRest.map(row).join('');
+      }
+      if (left > 0) {
+        html += `<button class="member-more-btn" data-more="page">
+          <svg class="ic"><use href="#i-chevron"/></svg>
+          Show ${Math.min(30, left)} more
+          <span>${shown} of ${all.length} shown</span>
+        </button>`;
+      } else if (!q && total > loaded) {
+        html += `<button class="member-more-btn" data-more="refresh">
+          <svg class="ic"><use href="#i-repeat"/></svg>
+          Refresh member list
+          <span>${total - loaded} members are hidden by this group</span>
+        </button>`;
+      } else if (!q && !restRows.length) {
         html += `<div class="member-more">Everyone in the group is already in the voice chat.</div>`;
-      } else if (!q && total > state.members.length) {
-        html += `<div class="member-more">${total - state.members.length} more in the group — they appear here once Telegram returns them.</div>`;
       }
     }
     $('#memberList').innerHTML = html;
+  }
+
+  /// Append the next page without throwing the list back to the top: the
+  /// repaint replaces the DOM, so the old scroll offset has to be restored.
+  function pageMembers() {
+    const box = $('#memberList');
+    const top = box ? box.scrollTop : 0;
+    memberShown += 30;
+    renderMembers(true);
+    if (box) box.scrollTop = top;
+  }
+
+  /// Ask the bot to re-read the roster. The pass runs in the background, so
+  /// give it a moment before repainting; when the group hides its member list
+  /// the count does not move and the toast says why instead of pretending.
+  async function refreshRoster() {
+    haptic('light');
+    toast('Refreshing members…');
+    try {
+      await api('/api/members/refresh', {});
+      await new Promise(r => setTimeout(r, 1200));
+      const s = await api('/api/state');
+      merge(s);
+      renderAll(true);
+      const n = state.members.length;
+      const total = state.room.members || n;
+      toast(n < total
+        ? `${n} of ${total} visible · the rest are hidden by this group`
+        : `Members updated · ${n} shown`);
+    } catch (err) {
+      toast(`Refresh failed: ${err.message}`);
+    }
   }
 
   /// Members-tab "more" sheet: local view controls up top, group-wide
@@ -2008,6 +2082,17 @@
   /// In-flight guard: a double tap on Send used to post the same text twice
   /// because the composer was cleared before the first request settled.
   let textSending = false;
+  /// Telegram always attributes Bot API posts to the bot. When the assistant
+  /// account is not in the group there is no user session to speak through,
+  /// so say it once instead of letting every message look mysteriously wrong.
+  let botTransportNoted = false;
+  function noteBotTransport(account) {
+    if (botTransportNoted) return;
+    botTransportNoted = true;
+    const who = account || 'the assistant account';
+    setTimeout(() => toast(`Posted as the bot — add ${who} to this group to post as a person`), 450);
+  }
+
   async function sendText() {
     if (!chatLive()) { toast('Voice chat ended — chat is cleared'); return; }
     if (textSending) return;
@@ -2050,6 +2135,7 @@
         senderId: viewer.id, senderName: viewer.name, tags: myTags(),
       });
       settleSend(clientId, res.message || null);
+      if (res && res.fallback === 'bot') noteBotTransport(res.fallback_account);
     } catch (e) {
       settleSend(clientId, null);
       editor().innerHTML = draft;
@@ -4074,6 +4160,16 @@
 
     // ── members
     $('#memberList').addEventListener('click', (e) => {
+      const more = e.target.closest('[data-more]');
+      if (more) {
+        if (more.dataset.more === 'page') {
+          pageMembers();
+          haptic('light');
+        } else {
+          refreshRoster();
+        }
+        return;
+      }
       const inv = e.target.closest('[data-invite]');
       if (inv) {
         const m = memberById(inv.dataset.invite);
@@ -4085,6 +4181,15 @@
       const row = e.target.closest('.member');
       if (row) openProfile(row.dataset.id);   // tap a member → profile card
     });
+    // Scrolling to the end appends the next page; the roster is already in
+    // memory, so this is a repaint and never a request.
+    $('#memberList').addEventListener('scroll', () => {
+      const box = $('#memberList');
+      if (!box) return;
+      if (box.scrollHeight - box.scrollTop - box.clientHeight > 140) return;
+      if (memberShown >= state.members.length) return;
+      pageMembers();
+    }, { passive: true });
     $('#ctxMenu').addEventListener('click', (e) => {
       const b = e.target.closest('[data-act]');
       if (b) memberAction(b.dataset.act);
@@ -4096,6 +4201,7 @@
     const clearSearch = $('#memberSearchClear');
     const applySearch = () => {
       memberQuery = search.value || '';
+      memberShown = 30;
       if (clearSearch) clearSearch.hidden = !memberQuery;
       renderMembers(true);
     };
@@ -4114,24 +4220,13 @@
       if (act === 'find') focusMemberSearch();
       else if (act === 'sort') {
         membersSort = SORT_CYCLE[(SORT_CYCLE.indexOf(membersSort) + 1) % SORT_CYCLE.length];
+        memberShown = 30;
         renderMembers(true);
         renderMembersSheet();
         toast(`Sorted by ${SORT_LABELS[membersSort].toLowerCase()}`);
       } else if (act === 'refresh') {
         closeSocial();
-        toast('Refreshing members…');
-        try {
-          await api('/api/members/refresh', {});
-          // The roster pass runs in the background; give it a moment before
-          // repainting so the new names are actually in the snapshot.
-          await new Promise(r => setTimeout(r, 1200));
-          const s = await api('/api/state');
-          merge(s);
-          renderAll(true);
-          toast(`Members updated · ${state.members.length} shown`);
-        } catch (err) {
-          toast(`Refresh failed: ${err.message}`);
-        }
+        refreshRoster();
       } else if (act === 'invite') { closeSocial(); openInvite(); }
       else if (act === 'chats') { closeSocial(); openChats(); }
       else if (act === 'dm') { closeSocial(); openDm(); }
